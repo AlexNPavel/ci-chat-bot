@@ -612,6 +612,7 @@ const (
 	ClusterVSphere Cluster = "vsphere"
 	ClusterARM01   Cluster = "arm01"
 	ClusterHive    Cluster = "hive"
+	ClusterMulti01 Cluster = "multi01"
 )
 
 // TestStepConfiguration describes a step that runs a
@@ -638,6 +639,10 @@ type TestStepConfiguration struct {
 	// You cannot set the Secret and Secrets attributes
 	// at the same time.
 	Secrets []*Secret `json:"secrets,omitempty"`
+
+	// Api allows access to the test via REST interface,
+	// currently only applicable for periodic jobs.
+	RemoteApi *bool `json:"remote_api,omitempty"`
 
 	// Cron is how often the test is expected to run outside
 	// of pull request workflows. Setting this field will
@@ -1129,6 +1134,7 @@ const (
 	ClusterProfileAWSSC2SQE             ClusterProfile = "aws-sc2s-qe"
 	ClusterProfileAWS1QE                ClusterProfile = "aws-1-qe"
 	ClusterProfileAWSSdQE               ClusterProfile = "aws-sd-qe"
+	ClusterProfileAWSPerfQE             ClusterProfile = "aws-perf-qe"
 	ClusterProfileAWSGluster            ClusterProfile = "aws-gluster"
 	ClusterProfileAWSManagedCSPIQE      ClusterProfile = "aws-managed-cspi-qe"
 	ClusterProfileAWSOSDMSP             ClusterProfile = "aws-osd-msp"
@@ -1165,6 +1171,8 @@ const (
 	ClusterProfileGCP2                  ClusterProfile = "gcp-openshift-gce-devel-ci-2"
 	ClusterProfileIBMCloud              ClusterProfile = "ibmcloud"
 	ClusterProfileIBMCloudQE            ClusterProfile = "ibmcloud-qe"
+	ClusterProfileIBMCloudMultiPpc64le  ClusterProfile = "ibmcloud-multi-ppc64le"
+	ClusterProfileIBMCloudMultiS390x    ClusterProfile = "ibmcloud-multi-s390x"
 	ClusterProfilePOWERVS1              ClusterProfile = "powervs-1"
 	ClusterProfilePOWERVS2              ClusterProfile = "powervs-2"
 	ClusterProfileLibvirtPpc64le        ClusterProfile = "libvirt-ppc64le"
@@ -1189,6 +1197,7 @@ const (
 	ClusterProfileVSphere               ClusterProfile = "vsphere"
 	ClusterProfileVSphere8              ClusterProfile = "vsphere-8"
 	ClusterProfileVSphereDiscon         ClusterProfile = "vsphere-discon"
+	ClusterProfileVSphereDis            ClusterProfile = "vsphere-dis"
 	ClusterProfileVSphereClusterbot     ClusterProfile = "vsphere-clusterbot"
 	ClusterProfileVSphereIBM7           ClusterProfile = "vsphere-ibm-7"
 	ClusterProfileVSpherePlatformNone   ClusterProfile = "vsphere-platform-none"
@@ -1203,6 +1212,7 @@ const (
 	ClusterProfileGCPVirtualization     ClusterProfile = "gcp-virtualization"
 	ClusterProfileAWSVirtualization     ClusterProfile = "aws-virtualization"
 	ClusterProfileAzureVirtualization   ClusterProfile = "azure-virtualization"
+	ClusterProfileOCIAssisted           ClusterProfile = "oci-assisted"
 )
 
 // ClusterProfiles are all valid cluster profiles
@@ -1218,6 +1228,7 @@ func ClusterProfiles() []ClusterProfile {
 		ClusterProfileAWSCentos,
 		ClusterProfileAWSCentos40,
 		ClusterProfileAWSCSPIQE,
+		ClusterProfileAWSPerfQE,
 		ClusterProfileAWSChinaQE,
 		ClusterProfileAWSGluster,
 		ClusterProfileAWSManagedCSPIQE,
@@ -1263,6 +1274,8 @@ func ClusterProfiles() []ClusterProfile {
 		ClusterProfileHyperShift,
 		ClusterProfileIBMCloud,
 		ClusterProfileIBMCloudQE,
+		ClusterProfileIBMCloudMultiPpc64le,
+		ClusterProfileIBMCloudMultiS390x,
 		ClusterProfilePOWERVS1,
 		ClusterProfilePOWERVS2,
 		ClusterProfileKubevirt,
@@ -1290,10 +1303,12 @@ func ClusterProfiles() []ClusterProfile {
 		ClusterProfileVSphere8,
 		ClusterProfileVSphereClusterbot,
 		ClusterProfileVSphereDiscon,
+		ClusterProfileVSphereDis,
 		ClusterProfileVSphereIBM7,
 		ClusterProfileVSphereMultizone,
 		ClusterProfileVSphereConnected,
 		ClusterProfileVSpherePlatformNone,
+		ClusterProfileOCIAssisted,
 	}
 }
 
@@ -1318,7 +1333,8 @@ func (p ClusterProfile) ClusterType() string {
 		ClusterProfileAWSSdQE,
 		ClusterProfileAWSVirtualization,
 		ClusterProfileFleetManagerQE,
-		ClusterProfileAWSLocalZones:
+		ClusterProfileAWSLocalZones,
+		ClusterProfileAWSPerfQE:
 		return string(CloudAWS)
 	case
 		ClusterProfileAlibabaCloud,
@@ -1378,6 +1394,10 @@ func (p ClusterProfile) ClusterType() string {
 		ClusterProfileIBMCloud,
 		ClusterProfileIBMCloudQE:
 		return "ibmcloud"
+	case ClusterProfileIBMCloudMultiPpc64le:
+		return "ibmcloud-multi-ppc64le"
+	case ClusterProfileIBMCloudMultiS390x:
+		return "ibmcloud-multi-s390x"
 	case ClusterProfilePOWERVS1:
 		return "powervs-1"
 	case ClusterProfilePOWERVS2:
@@ -1416,6 +1436,7 @@ func (p ClusterProfile) ClusterType() string {
 		ClusterProfileVSphere,
 		ClusterProfileVSphere8,
 		ClusterProfileVSphereDiscon,
+		ClusterProfileVSphereDis,
 		ClusterProfileVSphereClusterbot,
 		ClusterProfileVSphereIBM7,
 		ClusterProfileVSpherePlatformNone,
@@ -1437,6 +1458,8 @@ func (p ClusterProfile) ClusterType() string {
 		return "osd-ephemeral"
 	case ClusterProfileHyperShift:
 		return "hypershift"
+	case ClusterProfileOCIAssisted:
+		return "oci-edge"
 	default:
 		return ""
 	}
@@ -1468,6 +1491,8 @@ func (p ClusterProfile) LeaseType() string {
 		return "aws-china-qe-quota-slice"
 	case ClusterProfileAWSCSPIQE:
 		return "aws-cspi-qe-quota-slice"
+	case ClusterProfileAWSPerfQE:
+		return "aws-perf-qe-quota-slice"
 	case ClusterProfileAWSManagedCSPIQE:
 		return "aws-managed-cspi-qe-quota-slice"
 	case ClusterProfileAWSGovCloudQE:
@@ -1538,6 +1563,10 @@ func (p ClusterProfile) LeaseType() string {
 		return "ibmcloud-quota-slice"
 	case ClusterProfileIBMCloudQE:
 		return "ibmcloud-qe-quota-slice"
+	case ClusterProfileIBMCloudMultiPpc64le:
+		return "ibmcloud-multi-ppc64le-quota-slice"
+	case ClusterProfileIBMCloudMultiS390x:
+		return "ibmcloud-multi-s390x-quota-slice"
 	case ClusterProfilePOWERVS1:
 		return "powervs-1-quota-slice"
 	case ClusterProfilePOWERVS2:
@@ -1588,6 +1617,8 @@ func (p ClusterProfile) LeaseType() string {
 		return "vsphere-8-quota-slice"
 	case ClusterProfileVSphereDiscon:
 		return "vsphere-discon-quota-slice"
+	case ClusterProfileVSphereDis:
+		return "vsphere-dis-quota-slice"
 	case ClusterProfileVSphereClusterbot:
 		return "vsphere-clusterbot-quota-slice"
 	case ClusterProfileVSpherePlatformNone:
@@ -1608,6 +1639,8 @@ func (p ClusterProfile) LeaseType() string {
 		return "aws-3-quota-slice"
 	case ClusterProfileHyperShift:
 		return "hypershift-quota-slice"
+	case ClusterProfileOCIAssisted:
+		return "oci-edge-quota-slice"
 	default:
 		return ""
 	}
@@ -1660,6 +1693,7 @@ func (p ClusterProfile) Secret() string {
 		ClusterProfileVSphere8,
 		ClusterProfileVSphereClusterbot,
 		ClusterProfileVSphereDiscon,
+		ClusterProfileVSphereDis,
 		ClusterProfileVSphereConnected,
 		ClusterProfileVSphereIBM7,
 		ClusterProfileVSphereMultizone,
@@ -1674,7 +1708,7 @@ func (p ClusterProfile) Secret() string {
 // LeaseTypeFromClusterType maps cluster types to lease types
 func LeaseTypeFromClusterType(t string) (string, error) {
 	switch t {
-	case "aws", "aws-arm64", "aws-c2s", "aws-china", "aws-usgov", "aws-sc2s", "aws-osd-msp", "aws-outpost", "aws-local-zones", "alibaba", "azure-2", "azure4", "azure-arc", "azure-arm64", "azurestack", "azuremag", "equinix-ocp-metal", "gcp", "libvirt-ppc64le", "libvirt-s390x", "nutanix", "nutanix-qe", "nutanix-qe-dis", "openstack", "openstack-osuosl", "openstack-vexxhost", "openstack-ppc64le", "vsphere", "ovirt", "packet", "packet-edge", "powervs-1", "powervs-2", "kubevirt", "aws-cpaas", "osd-ephemeral", "gcp-virtualization", "aws-virtualization", "azure-virtualization":
+	case "aws", "aws-arm64", "aws-c2s", "aws-china", "aws-usgov", "aws-sc2s", "aws-osd-msp", "aws-outpost", "aws-local-zones", "alibaba", "azure-2", "azure4", "azure-arc", "azure-arm64", "azurestack", "azuremag", "equinix-ocp-metal", "gcp", "libvirt-ppc64le", "libvirt-s390x", "ibmcloud-multi-ppc64le", "ibmcloud-multi-s390x", "nutanix", "nutanix-qe", "nutanix-qe-dis", "openstack", "openstack-osuosl", "openstack-vexxhost", "openstack-ppc64le", "vsphere", "ovirt", "packet", "packet-edge", "powervs-1", "powervs-2", "kubevirt", "aws-cpaas", "osd-ephemeral", "gcp-virtualization", "aws-virtualization", "azure-virtualization":
 		return t + "-quota-slice", nil
 	default:
 		return "", fmt.Errorf("invalid cluster type %q", t)
@@ -1793,6 +1827,14 @@ const (
 	PipelineImageStreamTagReferenceBinaries     PipelineImageStreamTagReference = "bin"
 	PipelineImageStreamTagReferenceTestBinaries PipelineImageStreamTagReference = "test-bin"
 	PipelineImageStreamTagReferenceRPMs         PipelineImageStreamTagReference = "rpms"
+)
+
+// The fields in ReleaseBuildConfiguration which originate each pipeline image
+const (
+	PipelineImageStreamTagSourceRoot         = "build_root"
+	PipelineImageStreamTagSourceBinaries     = "binary_build_commands"
+	PipelineImageStreamTagSourceTestBinaries = "test_binary_build_commands"
+	PipelineImageStreamTagSourceRPMs         = "rpm_build_commands"
 )
 
 // SourceStepConfiguration describes a step that
@@ -2082,22 +2124,15 @@ func (m *MetadataWithTest) JobName(prefix string) string {
 	return m.Metadata.JobName(prefix, m.Test)
 }
 
-type Architecture string
-
-const (
-	AMD64Arch Architecture = "amd64"
-	ARM64Arch Architecture = "arm64"
-)
-
-var archToCluster = map[Architecture]Cluster{
-	ARM64Arch: ClusterARM01,
+var archToCluster = map[ReleaseArchitecture]Cluster{
+	ReleaseArchitectureARM64: ClusterARM01,
 }
 
-func (a Architecture) IsValid() bool {
+func (a ReleaseArchitecture) IsValid() bool {
 	return a.GetMappedCluster() != ""
 }
 
-func (a Architecture) GetMappedCluster() Cluster {
+func (a ReleaseArchitecture) GetMappedCluster() Cluster {
 	c, found := archToCluster[a]
 	if !found {
 		return ""
