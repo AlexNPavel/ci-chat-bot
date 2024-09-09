@@ -16,6 +16,7 @@ import (
 	imageclientset "github.com/openshift/client-go/image/clientset/versioned"
 	"k8s.io/apimachinery/pkg/util/sets"
 	corev1 "k8s.io/client-go/kubernetes/typed/core/v1"
+	crclient "sigs.k8s.io/controller-runtime/pkg/client"
 	prowapiv1 "sigs.k8s.io/prow/pkg/apis/prowjobs/v1"
 	prowjobClient "sigs.k8s.io/prow/pkg/client/clientset/versioned/typed/prowjobs/v1"
 	prowjobLister "sigs.k8s.io/prow/pkg/client/listers/prowjobs/v1"
@@ -214,6 +215,12 @@ type jobManager struct {
 	rosaNotifierFn   RosaCallbackFunc
 
 	errorMetric *prometheus.CounterVec
+
+	// mce on DPCR cluster
+	dpcrCoreClient      *corev1.CoreV1Client
+	dpcrOcmClient       crclient.WithWatch
+	dpcrHiveClient      crclient.WithWatch
+	dpcrNamespaceClient corev1.NamespaceInterface
 }
 
 // JobRequest keeps information about the request a user made to create

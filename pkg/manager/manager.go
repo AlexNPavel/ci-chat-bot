@@ -10,11 +10,12 @@ import (
 	"math"
 	"net/url"
 	"regexp"
-	prowClient "sigs.k8s.io/prow/pkg/client/clientset/versioned/typed/prowjobs/v1"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
+
+	prowClient "sigs.k8s.io/prow/pkg/client/clientset/versioned/typed/prowjobs/v1"
 
 	"github.com/openshift/ci-chat-bot/pkg/prow"
 	"github.com/openshift/ci-chat-bot/pkg/utils"
@@ -42,6 +43,7 @@ import (
 	"github.com/openshift/rosa/pkg/rosa"
 
 	typedcorev1 "k8s.io/client-go/kubernetes/typed/core/v1"
+	crclient "sigs.k8s.io/controller-runtime/pkg/client"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/klog"
@@ -130,6 +132,10 @@ func NewJobManager(
 	errorRate *prometheus.CounterVec,
 	rosaOidcConfigId string,
 	rosaBillingAccount string,
+	dpcrOcmClient crclient.WithWatch,
+	dpcrHiveClient crclient.WithWatch,
+	dpcrNamespaceClient typedcorev1.NamespaceInterface,
+	dpcrCoreClient *typedcorev1.CoreV1Client,
 ) *jobManager {
 	m := &jobManager{
 		requests:         make(map[string]*JobRequest),
@@ -162,6 +168,10 @@ func NewJobManager(
 		rosaOidcConfigId:         rosaOidcConfigId,
 		rosaBillingAccount:       rosaBillingAccount,
 		errorMetric:              errorRate,
+		dpcrCoreClient:           dpcrCoreClient,
+		dpcrOcmClient:            dpcrOcmClient,
+		dpcrHiveClient:           dpcrHiveClient,
+		dpcrNamespaceClient:      dpcrNamespaceClient,
 	}
 	m.muJob.running = make(map[string]struct{})
 	initializeErrorMetrics(m.errorMetric)
