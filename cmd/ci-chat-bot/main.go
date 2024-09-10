@@ -243,19 +243,19 @@ func run() error {
 		klog.Warning("hive config missing `hive` cluster context; will not support hypershift outside of default version")
 	}
 
-	var hiveClient, ocmClient crclient.WithWatch
+	var hiveClient, ocmClient crclient.Client
 	var dpcrCoreClient *corev1.CoreV1Client
 	var mceNamespaceClient corev1.NamespaceInterface
 	if config, ok := kubeConfigs["dpcr"]; ok {
 		// hive client for ClusterDeployments
-		hiveClient, err = crclient.NewWithWatch(&config, crclient.Options{Scheme: hivescheme.GetScheme()})
+		hiveClient, err = crclient.New(&config, crclient.Options{Scheme: hivescheme.GetScheme()})
 		if err != nil {
 			return fmt.Errorf("unable to create dpcr hive client: %w", err)
 		}
 		// ocm client for ManagedClusters
 		ocmScheme := machineryruntime.NewScheme()
 		clusterv1.Install(ocmScheme)
-		ocmClient, err = crclient.NewWithWatch(&config, crclient.Options{Scheme: ocmScheme})
+		ocmClient, err = crclient.New(&config, crclient.Options{Scheme: ocmScheme})
 		if err != nil {
 			return fmt.Errorf("unable to create dpcr ocm client: %w", err)
 		}

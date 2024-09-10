@@ -132,8 +132,8 @@ func NewJobManager(
 	errorRate *prometheus.CounterVec,
 	rosaOidcConfigId string,
 	rosaBillingAccount string,
-	dpcrOcmClient crclient.WithWatch,
-	dpcrHiveClient crclient.WithWatch,
+	dpcrOcmClient crclient.Client,
+	dpcrHiveClient crclient.Client,
 	dpcrNamespaceClient typedcorev1.NamespaceInterface,
 	dpcrCoreClient *typedcorev1.CoreV1Client,
 ) *jobManager {

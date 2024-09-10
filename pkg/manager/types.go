@@ -218,8 +218,8 @@ type jobManager struct {
 
 	// mce on DPCR cluster
 	dpcrCoreClient      *corev1.CoreV1Client
-	dpcrOcmClient       crclient.WithWatch
-	dpcrHiveClient      crclient.WithWatch
+	dpcrOcmClient       crclient.Client
+	dpcrHiveClient      crclient.Client
 	dpcrNamespaceClient corev1.NamespaceInterface
 }
 

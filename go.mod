@@ -9,20 +9,20 @@ replace (
 	github.com/apcera/gssapi => github.com/openshift/gssapi v0.0.0-20161010215902-5fb4217df13b
 	github.com/bombsimon/logrusr => github.com/stevekuznetsov/logrusr v1.1.1-0.20210709145202-301b9fbb8872
 	github.com/docker/docker => github.com/openshift/moby-moby v1.4.2-0.20190308215630-da810a85109d
-	github.com/google/cel-go => github.com/google/cel-go v0.17.8
+	//github.com/google/cel-go => github.com/google/cel-go v0.17.8
 	github.com/moby/buildkit => github.com/dmcgowan/buildkit v0.0.0-20170731200553-da2b9dc7dab9
 	github.com/openshift/client-go => github.com/openshift/client-go v0.0.0-20240528061634-b054aa794d87
 	github.com/openshift/hive => github.com/openshift/hive v0.0.0-20240904155057-b6cdaa9cb317
 	github.com/openshift/hive/apis => github.com/openshift/hive/apis v0.0.0-20240904155057-b6cdaa9cb317
-	k8s.io/component-base => k8s.io/component-base v0.27.2
-	k8s.io/kubectl => k8s.io/kubectl v0.27.2
+	k8s.io/component-base => k8s.io/component-base v0.31.0
+	k8s.io/kubectl => k8s.io/kubectl v0.31.0
 )
 
 // from hive; needed because otherwise v12.0.0 is picked up as a more recent version
 replace (
-	k8s.io/apimachinery => k8s.io/apimachinery v0.30.2
+	k8s.io/apimachinery => k8s.io/apimachinery v0.31.0
 	k8s.io/client-go => k8s.io/client-go v0.31.0
-	sigs.k8s.io/controller-runtime => sigs.k8s.io/controller-runtime v0.18.3
+	sigs.k8s.io/controller-runtime => sigs.k8s.io/controller-runtime v0.19.0
 )
 
 // from hive
@@ -66,11 +66,14 @@ require (
 require (
 	github.com/PaesslerAG/gval v1.0.0 // indirect
 	github.com/PaesslerAG/jsonpath v0.1.1 // indirect
+	github.com/antlr4-go/antlr/v4 v4.13.0 // indirect
+	github.com/fxamacker/cbor/v2 v2.7.0 // indirect
 	github.com/go-logr/zapr v1.3.0 // indirect
 	github.com/kdomanski/iso9660 v0.2.1 // indirect
 	github.com/metal3-io/baremetal-operator/apis v0.4.0 // indirect
 	github.com/metal3-io/baremetal-operator/pkg/hardwareutils v0.4.0 // indirect
 	github.com/nutanix-cloud-native/prism-go-client v0.3.4 // indirect
+	github.com/x448/float16 v0.8.4 // indirect
 	k8s.io/apiextensions-apiserver v0.31.0 // indirect
 )
 
@@ -89,7 +92,6 @@ require (
 	github.com/RangelReale/osincli v0.0.0-20160924135400-fababb0555f2 // indirect
 	github.com/alessio/shellescape v1.4.1 // indirect
 	github.com/alexbrainman/sspi v0.0.0-20180613141037-e580b900e9f5 // indirect
-	github.com/antlr/antlr4/runtime/Go/antlr/v4 v4.0.0-20230321174746-8dcc6526cfb1 // indirect
 	github.com/apcera/gssapi v0.0.0-00010101000000-000000000000 // indirect
 	github.com/asaskevich/govalidator v0.0.0-20230301143203-a9d515a09cc2 // indirect
 	github.com/aws/aws-sdk-go-v2 v1.30.0 // indirect
@@ -141,7 +143,7 @@ require (
 	github.com/dvsekhvalnov/jose2go v1.6.0 // indirect
 	github.com/fatih/color v1.17.0 // indirect
 	github.com/felixge/httpsnoop v1.0.4 // indirect
-	github.com/ghodss/yaml v1.0.1-0.20190212211648-25d852aebe32 // indirect
+	github.com/ghodss/yaml v1.0.1-0.20190212211648-25d852aebe32
 	github.com/go-git/gcfg v1.5.1-0.20230307220236-3a3c6141e376 // indirect
 	github.com/go-git/go-billy/v5 v5.5.0 // indirect
 	github.com/go-git/go-git/v5 v5.12.0 // indirect
@@ -188,7 +190,7 @@ require (
 	github.com/openshift/cluster-api-provider-ovirt v0.1.1-0.20220323121149-e3f2850dd519 // indirect
 	github.com/openshift/cluster-autoscaler-operator v0.0.0-20211006175002-fe524080b551 // indirect
 	github.com/openshift/custom-resource-status v1.1.3-0.20220503160415-f2fdb4999d87 // indirect
-	github.com/openshift/hive/apis v0.0.0 // indirect
+	github.com/openshift/hive/apis v0.0.0
 	github.com/openshift/installer v0.9.0-master.0.20240613201043-5e36f8fb1dde
 	github.com/openshift/library-go v0.0.0-20240715191351-e0aa70d55678 // indirect
 	github.com/otiai10/copy v1.2.0 // indirect
@@ -225,7 +227,6 @@ require (
 	google.golang.org/genproto/googleapis/api v0.0.0-20240528184218-531527333157 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20240711142825-46eb208f015d // indirect
 	gopkg.in/warnings.v0 v0.1.2 // indirect
-	gotest.tools/v3 v3.0.3 // indirect
 	k8s.io/apiserver v0.31.0 // indirect
 	k8s.io/cluster-registry v0.0.6 // indirect
 	k8s.io/kube-aggregator v0.30.1 // indirect
