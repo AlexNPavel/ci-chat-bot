@@ -9,11 +9,13 @@ import (
 	"github.com/openshift/ci-chat-bot/pkg/utils"
 	"github.com/openshift/rosa/pkg/rosa"
 	"github.com/prometheus/client_golang/prometheus"
+	clusterv1 "open-cluster-management.io/api/cluster/v1"
 
 	clustermgmtv1 "github.com/openshift-online/ocm-sdk-go/clustersmgmt/v1"
 	citools "github.com/openshift/ci-tools/pkg/api"
 	"github.com/openshift/ci-tools/pkg/lease"
 	imageclientset "github.com/openshift/client-go/image/clientset/versioned"
+	hivev1 "github.com/openshift/hive/apis/hive/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
 	corev1 "k8s.io/client-go/kubernetes/typed/core/v1"
 	crclient "sigs.k8s.io/controller-runtime/pkg/client"
@@ -221,6 +223,17 @@ type jobManager struct {
 	dpcrOcmClient       crclient.Client
 	dpcrHiveClient      crclient.Client
 	dpcrNamespaceClient corev1.NamespaceInterface
+
+	mceClusters struct {
+		lock               sync.RWMutex
+		clusters           map[string]*clusterv1.ManagedCluster
+		deployments        map[string]*hivev1.ClusterDeployment
+		clusterKubeconfigs map[string]string
+		clusterPasswords   map[string]string
+		imagesets          sets.Set[string]
+	}
+	mceNotifierFn MCECallbackFunc
+	mceConfig     MceConfig
 }
 
 // JobRequest keeps information about the request a user made to create
@@ -277,6 +290,12 @@ type JobManager interface {
 	GetWorkflowConfig() *WorkflowConfig
 	ResolveImageOrVersion(imageOrVersion, defaultImageOrVersion, architecture string) (string, string, string, error)
 	ResolveAsPullRequest(spec string) (*prowapiv1.Refs, error)
+
+	CreateMceCluster(user, channel, platform, imageset string, duration time.Duration) (string, error)
+	DeleteMceCluster(user, clusterName string) (string, error)
+	GetManagedClustersForUser(user string) (map[string]*clusterv1.ManagedCluster, map[string]*hivev1.ClusterDeployment, map[string]string, map[string]string)
+	ListManagedClusters() string
+	ListImagesets() string
 }
 
 // JobCallbackFunc is invoked when the job changes state in a significant
@@ -286,6 +305,10 @@ type JobCallbackFunc func(Job)
 // RosaCallbackFunc is invoked when the rosa cluster changes state in a significant
 // way. Takes the cluster object and admin password.
 type RosaCallbackFunc func(*clustermgmtv1.Cluster, string)
+
+// RosaCallbackFunc is invoked when the rosa cluster changes state in a significant
+// way. Takes the ManagedCluster object, kubeconfig, and admin password.
+type MCECallbackFunc func(*clusterv1.ManagedCluster, string, string)
 
 // JobInput defines the input to a job. Different modes need different inputs.
 type JobInput struct {
@@ -354,4 +377,18 @@ type ListFilters struct {
 	Platform  string
 	Version   string
 	Requestor string
+}
+
+type MceConfig struct {
+	Users map[string]MceUser `yaml:"users"`
+	Mutex sync.RWMutex       `yaml:"-"` // this field just allows us to update the above values without races
+}
+
+type MceUser struct {
+	MaxClusters   int    `yaml:"max_clusters,omitempty"`
+	MaxClusterAge int    `yaml:"max_cluster_age_hours,omitempty"`
+	AwsSecret     string `yaml:"aws_secret,omitempty"`
+	AwsBaseDomain string `yaml:"aws_base_domain,omitempty"`
+	GcpSecret     string `yaml:"gcp_secret,omitempty"`
+	GcpBaseDomain string `yaml:"gcp_base_domain,omitempty"`
 }

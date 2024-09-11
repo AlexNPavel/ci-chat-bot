@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	clusterv1 "open-cluster-management.io/api/cluster/v1"
 	prowClient "sigs.k8s.io/prow/pkg/client/clientset/versioned/typed/prowjobs/v1"
 
 	"github.com/openshift/ci-chat-bot/pkg/prow"
@@ -38,6 +39,7 @@ import (
 	imagev1 "github.com/openshift/api/image/v1"
 	citools "github.com/openshift/ci-tools/pkg/api"
 	imageclientset "github.com/openshift/client-go/image/clientset/versioned"
+	hivev1 "github.com/openshift/hive/apis/hive/v1"
 
 	"github.com/openshift/rosa/pkg/ocm"
 	"github.com/openshift/rosa/pkg/rosa"
@@ -178,6 +180,21 @@ func NewJobManager(
 	return m
 }
 
+func (m *jobManager) updateImageSetList() error {
+	imagesetList := hivev1.ClusterImageSetList{}
+	if err := m.dpcrHiveClient.List(context.TODO(), &imagesetList); err != nil {
+		return err
+	}
+	updatedImageSets := sets.Set[string]{}
+	for _, imageset := range imagesetList.Items {
+		updatedImageSets.Insert(imageset.GetName())
+	}
+	m.mceClusters.lock.Lock()
+	defer m.mceClusters.lock.Unlock()
+	m.mceClusters.imagesets = updatedImageSets
+	return nil
+}
+
 func (m *jobManager) updateHypershiftSupportedVersions() error {
 	if m.hiveConfigMapClient == nil {
 		HypershiftSupportedVersions.Mu.Lock()
@@ -259,6 +276,12 @@ func (m *jobManager) Start() error {
 		}
 	}, time.Minute)
 	go wait.Forever(func() {
+		if err := m.mceSync(); err != nil {
+			klog.Infof("error during mce sync: %v", err)
+			return
+		}
+	}, time.Minute)
+	go wait.Forever(func() {
 		if err := m.updateHypershiftSupportedVersions(); err != nil {
 			klog.Warningf("error during updateSupportedVersions: %v", err)
 		}
@@ -266,6 +289,11 @@ func (m *jobManager) Start() error {
 	go wait.Forever(func() {
 		if err := m.updateRosaVersions(); err != nil {
 			klog.Warningf("error during updateRosaVersions: %v", err)
+		}
+	}, time.Minute*5)
+	go wait.Forever(func() {
+		if err := m.updateImageSetList(); err != nil {
+			klog.Warningf("error during updateImageSetList: %v", err)
 		}
 	}, time.Minute*5)
 	return nil
@@ -285,6 +313,78 @@ func paramsToString(params map[string]string) string {
 	}
 	sort.Strings(pairs)
 	return strings.Join(pairs, ",")
+}
+
+func (m *jobManager) mceSync() error {
+	clusters, deployments, err := m.listManagedClusters()
+	if err != nil {
+		return fmt.Errorf("Failed to list managed clusters: %v", err)
+	}
+	now := time.Now()
+	managedClusters := map[string]*clusterv1.ManagedCluster{}
+	for _, cluster := range clusters {
+		expiryString := cluster.Labels["expiry-time"]
+		expiryTime, err := time.Parse(time.RFC3339, expiryString)
+		if err != nil {
+			return err
+		}
+		if expiryTime.Before(now) {
+			if err := m.deleteManagedCluster(cluster.GetName()); err != nil {
+				return err
+			}
+		}
+		managedClusters[cluster.Name] = cluster
+	}
+	clusterDeployments := map[string]*hivev1.ClusterDeployment{}
+	for _, deployment := range deployments {
+		clusterDeployments[deployment.Name] = deployment
+	}
+	m.mceClusters.lock.Lock()
+	m.mceClusters.clusters = managedClusters
+	m.mceClusters.deployments = clusterDeployments
+	m.mceClusters.lock.Unlock()
+	m.mceClusters.lock.RLock()
+	defer m.mceClusters.lock.RUnlock()
+	for name, cluster := range managedClusters {
+		_, ok := m.mceClusters.clusterKubeconfigs[name]
+		_, ok2 := m.mceClusters.clusterPasswords[name]
+		if !ok || !ok2 {
+			m.mceClusters.lock.RUnlock() // getClusterAuth requires a full lock
+			_, _, err := m.getClusterAuth(name)
+			m.mceClusters.lock.RLock()
+			if err != nil {
+				klog.Errorf("Failed to get cluster auth for %s: %v", name, err)
+			}
+		}
+		previous := m.mceClusters.clusters[name]
+
+		var availability, prevAvailability string
+		for _, condition := range cluster.Status.Conditions {
+			if condition.Type == "ManagedClusterConditionAvailable" {
+				availability = string(condition.Status)
+			}
+		}
+		if previous != nil {
+			for _, condition := range previous.Status.Conditions {
+				if condition.Type == "ManagedClusterConditionAvailable" {
+					prevAvailability = string(condition.Status)
+				}
+			}
+		}
+
+		if availability == "True" && prevAvailability != "True" {
+			m.mceClusters.lock.RUnlock() // getClusterAuth requires a full lock
+			// notify that the cluster is available and retrieve auth
+			kubeconfig, password, err := m.getClusterAuth(name)
+			m.mceClusters.lock.RLock()
+			if err != nil {
+				return fmt.Errorf("Failed to get mce cluster auth: %v", err)
+			}
+			m.mceNotifierFn(cluster, kubeconfig, password)
+		}
+	}
+	klog.Infof("Found %d chat-bot owned mce clusters", len(managedClusters))
+	return nil
 }
 
 func (m *jobManager) rosaSync() error {
@@ -1979,6 +2079,103 @@ func (m *jobManager) finishJob(name string) {
 
 func UseSpotInstances(job *Job) bool {
 	return job.Mode == JobTypeLaunch && len(job.JobParams) == 0 && (job.Platform == "aws" || job.Platform == "aws-2")
+}
+
+func (m *jobManager) CreateMceCluster(user, channel, platform, imageset string, duration time.Duration) (string, error) {
+	m.mceConfig.Mutex.RLock()
+	{
+		// this section is nested to allow the defer to be executed before calling the createManagedCluster function
+		defer m.mceConfig.Mutex.RUnlock()
+		userConfig, ok := m.mceConfig.Users[user]
+		if !ok {
+			return "", fmt.Errorf("User `%s` is currently unauthorized to use MCE.", user)
+		}
+		m.mceClusters.lock.RLock()
+		defer m.mceClusters.lock.RUnlock()
+		managed, _, _, _ := m.GetManagedClustersForUser(user)
+		if len(managed) >= userConfig.MaxClusters {
+			return "", fmt.Errorf("Maximum number of MCE clusters (%d) reached. Please delete an existing cluster before creating a new one.", userConfig.MaxClusters)
+		}
+		if duration.Hours() > float64(userConfig.MaxClusterAge) {
+			return "", fmt.Errorf("Your user's maximum duration for an MCE cluster is %d hours", userConfig.MaxClusterAge)
+		}
+	}
+	cluster, err := m.createManagedCluster(imageset, platform, user, channel)
+	if err != nil {
+		return "", fmt.Errorf("Failed to create cluster: %v", err)
+	}
+	go m.mceSync() // nolint:errcheck
+	return fmt.Sprintf("Installing cluster `%s` using imageset `%s`.", cluster.GetName(), imageset), nil
+}
+
+func (m *jobManager) DeleteMceCluster(user, clusterName string) (string, error) {
+	m.mceClusters.lock.RLock()
+	defer m.mceClusters.lock.RUnlock()
+	var cluster *clusterv1.ManagedCluster
+	for name, existingCluster := range m.mceClusters.clusters {
+		if name == clusterName {
+			if existingCluster.Annotations[utils.UserTag] != user {
+				return fmt.Sprintf("You are not the owner of cluster `%s`", clusterName), nil
+			}
+			cluster = existingCluster
+			break
+		}
+	}
+	if cluster == nil {
+		return fmt.Sprintf("Cluster `%s` not found", clusterName), nil
+	}
+	if err := m.deleteManagedCluster(clusterName); err != nil {
+		return "", fmt.Errorf("Failed to delete cluster: %v", err)
+	}
+	go m.mceSync() // nolint:errcheck
+	return fmt.Sprintf("Cluster %s marked for deletion", clusterName), nil
+}
+
+func (m *jobManager) GetManagedClustersForUser(user string) (map[string]*clusterv1.ManagedCluster, map[string]*hivev1.ClusterDeployment, map[string]string, map[string]string) {
+	m.mceClusters.lock.RLock()
+	defer m.mceClusters.lock.RUnlock()
+	managed := make(map[string]*clusterv1.ManagedCluster)
+	deployments := make(map[string]*hivev1.ClusterDeployment)
+	kubeconfigs := make(map[string]string)
+	passwords := make(map[string]string)
+	for _, mc := range m.mceClusters.clusters {
+		if mc.Annotations[utils.UserTag] == user {
+			managed[mc.GetName()] = mc
+			deployments[mc.GetName()] = m.mceClusters.deployments[mc.GetName()]
+			kubeconfigs[mc.GetName()] = m.mceClusters.clusterKubeconfigs[mc.GetName()]
+			passwords[mc.GetName()] = m.mceClusters.clusterPasswords[mc.GetName()]
+		}
+	}
+	return managed, deployments, kubeconfigs, passwords
+}
+
+func (m *jobManager) ListManagedClusters() string {
+	m.mceClusters.lock.RLock()
+	defer m.mceClusters.lock.RUnlock()
+	numClusters := len(m.mceClusters.clusters)
+	buf := &bytes.Buffer{}
+	if numClusters == 0 {
+		return "No clusters up"
+	}
+	fmt.Fprintf(buf, "%d clusters currently running:\n", numClusters)
+	for name, cluster := range m.mceClusters.clusters {
+		expiryTimeTag := cluster.Annotations[utils.ExpiryTimeTag]
+		expiryTime, err := time.Parse(time.RFC3339, expiryTimeTag)
+		if err != nil {
+
+		}
+		remainingTime := time.Until(expiryTime)
+		fmt.Fprintf(buf, "- %s (Requested by @%s; Remaining Time: %s)\n", name, cluster.Annotations[utils.UserTag], remainingTime.String())
+	}
+	return buf.String()
+}
+
+func (m *jobManager) ListImagesets() string {
+	m.mceClusters.lock.RLock()
+	defer m.mceClusters.lock.RUnlock()
+	imagesets := m.mceClusters.imagesets.UnsortedList()
+	sort.Strings(imagesets)
+	return fmt.Sprintf("Available imagesets for MCE clusters: %s", strings.Join(imagesets, ", "))
 }
 
 func (m *jobManager) CreateRosaCluster(user, channel, version string, duration time.Duration) (string, error) {

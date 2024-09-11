@@ -14,8 +14,10 @@ import (
 	"github.com/openshift/ci-chat-bot/pkg/manager"
 	"github.com/openshift/ci-chat-bot/pkg/slack/parser"
 	"github.com/openshift/ci-chat-bot/pkg/utils"
+	hivev1 "github.com/openshift/hive/apis/hive/v1"
 	"github.com/slack-go/slack"
 	"k8s.io/klog"
+	clusterv1 "open-cluster-management.io/api/cluster/v1"
 	prowapiv1 "sigs.k8s.io/prow/pkg/apis/prowjobs/v1"
 )
 
@@ -162,6 +164,31 @@ func (b *Bot) SupportedCommands() []parser.BotCommand {
 			Description: "Create an operator, bundle, and catalog from a pull request. The successful build location will be sent to you when it completes and then preserved for 12 hours.  To obtain a pull secret use `oc registry login --to /path/to/pull-secret` after using `oc login` to login to the relevant CI cluster.",
 			Example:     "catalog build openshift/aws-efs-csi-driver-operator#75 aws-efs-csi-driver-operator-bundle",
 			Handler:     CatalogBuild,
+		}),
+		parser.NewBotCommand("mce create <imageset> <duration>", &parser.CommandDefinition{
+			Description: "Create a new cluster using Hive and MCE.",
+			Example:     "mce create img4.16.7-multi-appsub 6h",
+			Handler:     MceCreate,
+		}),
+		parser.NewBotCommand("mce auth <cluster_name>", &parser.CommandDefinition{
+			Description: "Print kubeconfig and kubeadmin password for specified MCE cluster.",
+			Example:     "mce auth mycluster",
+			Handler:     MceAuth,
+		}),
+		parser.NewBotCommand("mce delete <cluster_name>", &parser.CommandDefinition{
+			Description: "Delete a previously created MCE cluster.",
+			Example:     "mce delete mycluster",
+			Handler:     MceDelete,
+		}),
+		parser.NewBotCommand("mce list", &parser.CommandDefinition{
+			Description: "List active MCE clusters.",
+			Example:     "mce list",
+			Handler:     MceList,
+		}),
+		parser.NewBotCommand("mce imagesets", &parser.CommandDefinition{
+			Description: "List available imagesets for MCE clusters.",
+			Example:     "mce list",
+			Handler:     MceImageSets,
 		}),
 	}
 }
@@ -497,6 +524,47 @@ func ParseOptions(options string, inputs [][]string, jobType manager.JobType) (s
 		return "", "", nil, fmt.Errorf("The hypershift-hosted platform requires a multiarch image. See: https://docs.ci.openshift.org/docs/architecture/ci-operator/#testing-with-a-cluster-from-hypershift")
 	}
 	return platform, architecture, params, nil
+}
+
+func NotifyMce(client *slack.Client, cluster *clusterv1.ManagedCluster, clusterDeployment *hivev1.ClusterDeployment, kubeconfig, password string) {
+	channel := cluster.Annotations[utils.ChannelTag]
+	var availability string
+	for _, condition := range cluster.Status.Conditions {
+		if condition.Type == "ManagedClusterConditionAvailable" {
+			availability = string(condition.Status)
+		}
+	}
+	if availability == "True" {
+		message := fmt.Sprintf("your cluster (name: `%s`) is ready")
+		expiryTime, err := base64.RawStdEncoding.DecodeString(cluster.Annotations[utils.ExpiryTimeTag])
+		if err != nil {
+			klog.Errorf("Failed to base64 decode expiry time tag: %v", err)
+			message += "."
+		} else if parsedExpiryTime, err := time.Parse(time.RFC3339, string(expiryTime)); err != nil {
+			klog.Errorf("Failed to parse expiry time: %v", err)
+			message += "."
+		} else {
+			message += fmt.Sprintf(", it will be shut down automatically in ~%d minutes.", time.Until(parsedExpiryTime)/time.Minute)
+		}
+		requestTime, err := base64.RawStdEncoding.DecodeString(cluster.Annotations[utils.RequestTimeTag])
+		if err != nil {
+			klog.Errorf("Failed to base64 decode request time tag: %v", err)
+		}
+		parsedRequestTime, err := time.Parse(time.RFC3339, string(requestTime))
+		if err != nil {
+			// fall back to current time if parse fails
+			parsedRequestTime = time.Now()
+			klog.Errorf("Failed to parse request time: %v", err)
+		}
+		message += "\n" + clusterDeployment.Status.WebConsoleURL
+		ocLoginCommand := fmt.Sprintf("oc login %s --username kubeadmin --password %s", clusterDeployment.Status.APIURL, password)
+		message += "\n\nLog in to the console with user `kubeadmin` and password `" + password + "`.\nTo use the `oc` command, log in by running `" + ocLoginCommand + "`."
+		SendKubeConfig(client, channel, kubeconfig, message, parsedRequestTime.Format("2006-01-02-150405"))
+		return
+	}
+	if _, _, err := client.PostMessage(channel, slack.MsgOptionText(fmt.Sprintf("Cluster %s is not yet available", cluster.GetName()), false)); err != nil {
+		klog.Warningf("Failed to post the message to the channel: %s.", channel)
+	}
 }
 
 func NotifyRosa(client *slack.Client, cluster *clustermgmtv1.Cluster, password string) {
