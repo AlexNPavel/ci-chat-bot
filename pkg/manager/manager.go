@@ -384,6 +384,17 @@ func (m *jobManager) mceSync() error {
 		}
 	}
 	klog.Infof("Found %d chat-bot owned mce clusters", len(managedClusters))
+	userConfigSecret, err := m.dpcrCoreClient.Secrets("ci-chat-bot-mce-config").Get(context.TODO(), "user-config", metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("Failed to retrieve mce user configs: %v", err)
+	}
+	mceUserConfig := map[string]MceUser{}
+	if err := yaml.Unmarshal(userConfigSecret.Data["config.yaml"], mceUserConfig); err != nil {
+		return fmt.Errorf("Failed to unmarshal MCE user config: %v", err)
+	}
+	m.mceConfig.Mutex.Lock()
+	defer m.mceConfig.Mutex.Unlock()
+	m.mceConfig.Users = mceUserConfig
 	return nil
 }
 
@@ -2162,7 +2173,9 @@ func (m *jobManager) ListManagedClusters() string {
 		expiryTimeTag := cluster.Annotations[utils.ExpiryTimeTag]
 		expiryTime, err := time.Parse(time.RFC3339, expiryTimeTag)
 		if err != nil {
-
+			klog.Errorf("Failed to parse expiryTime: %v", err)
+			fmt.Fprintf(buf, "- %s (Requested by @%s; Remaining Time: error)\n", name, cluster.Annotations[utils.UserTag])
+			continue
 		}
 		remainingTime := time.Until(expiryTime)
 		fmt.Fprintf(buf, "- %s (Requested by @%s; Remaining Time: %s)\n", name, cluster.Annotations[utils.UserTag], remainingTime.String())

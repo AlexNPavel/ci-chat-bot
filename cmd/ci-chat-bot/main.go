@@ -254,7 +254,9 @@ func run() error {
 		}
 		// ocm client for ManagedClusters
 		ocmScheme := machineryruntime.NewScheme()
-		clusterv1.Install(ocmScheme)
+		if err := clusterv1.Install(ocmScheme); err != nil {
+			return fmt.Errorf("Failed to install ocm scheme: %v", err)
+		}
 		ocmClient, err = crclient.New(&config, crclient.Options{Scheme: ocmScheme})
 		if err != nil {
 			return fmt.Errorf("unable to create dpcr ocm client: %w", err)

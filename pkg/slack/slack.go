@@ -535,7 +535,7 @@ func NotifyMce(client *slack.Client, cluster *clusterv1.ManagedCluster, clusterD
 		}
 	}
 	if availability == "True" {
-		message := fmt.Sprintf("your cluster (name: `%s`) is ready")
+		message := fmt.Sprintf("your cluster (name: `%s`) is ready", cluster.GetName())
 		expiryTime, err := base64.RawStdEncoding.DecodeString(cluster.Annotations[utils.ExpiryTimeTag])
 		if err != nil {
 			klog.Errorf("Failed to base64 decode expiry time tag: %v", err)

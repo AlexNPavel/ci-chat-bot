@@ -245,38 +245,6 @@ func (m *jobManager) listManagedClusters() ([]*clusterv1.ManagedCluster, []*hive
 	return managedClusters, clusterDeployments, nil
 }
 
-func (m *jobManager) printManagedClusters() (string, error) {
-	managedClusters, _, err := m.listManagedClusters()
-	if err != nil {
-		return "", err
-	}
-	response := fmt.Sprintf("There are %d MCE clusters managed by ci-chat-bot:", len(managedClusters))
-	for _, cluster := range managedClusters {
-		response += fmt.Sprintf("\n%s: %s", cluster.Name, cluster.Status.Version)
-	}
-	return response, nil
-}
-
-func (m *jobManager) cleanupExpiredClusters() error {
-	clusters, _, err := m.listManagedClusters()
-	if err != nil {
-		return err
-	}
-	for _, cluster := range clusters {
-		expiryString := cluster.Labels["expiry-time"]
-		expiryTime, err := time.Parse(time.RFC3339, expiryString)
-		if err != nil {
-			return err
-		}
-		if time.Now().Compare(expiryTime) > 0 {
-			if err := m.dpcrOcmClient.Delete(context.TODO(), cluster); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
-}
-
 // getClusterAuth returns kubeconfig,password,error
 func (m *jobManager) getClusterAuth(name string) (string, string, error) {
 	m.mceClusters.lock.RLock()
