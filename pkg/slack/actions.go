@@ -105,11 +105,11 @@ func MceAuth(client *slack.Client, jobManager manager.JobManager, event *slackev
 		return "mce auth take exactly 1 argument"
 	}
 	name := nameInput[0]
-	managed, deployments, kubeconfigs, passwords := jobManager.GetManagedClustersForUser(event.User)
+	managed, deployments, provisions, kubeconfigs, passwords := jobManager.GetManagedClustersForUser(event.User)
 	if _, ok := managed[name]; !ok {
 		return fmt.Sprintf("No cluster called `%s` for your user found", name)
 	}
-	NotifyMce(client, managed[name], deployments[name], kubeconfigs[name], passwords[name])
+	NotifyMce(client, managed[name], deployments[name], provisions[name], kubeconfigs[name], passwords[name])
 	return " "
 }
 
@@ -555,11 +555,10 @@ func MceDelete(client *slack.Client, jobManager manager.JobManager, event *slack
 	if err != nil {
 		return err.Error()
 	}
-	name := ""
-	if len(name) != 1 {
-		return "platform takes 1 input"
+	if len(nameInput) != 1 {
+		return "cluster_name takes 1 input"
 	}
-	name = nameInput[0]
+	name := nameInput[0]
 	msg, err := jobManager.DeleteMceCluster(event.User, name)
 	if err != nil {
 		return err.Error()

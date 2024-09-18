@@ -70,6 +70,36 @@ func (b *Bot) RosaResponder(s *slack.Client) func(*clustermgmtv1.Cluster, string
 	}
 }
 
+func (b *Bot) MceResponder(s *slack.Client) func(*clusterv1.ManagedCluster, *hivev1.ClusterDeployment, *hivev1.ClusterProvision, string, string) {
+	return func(cluster *clusterv1.ManagedCluster, clusterDeployment *hivev1.ClusterDeployment, clusterProvision *hivev1.ClusterProvision, kubeconfig, password string) {
+		if len(cluster.Annotations[utils.UserTag]) == 0 || len(cluster.Annotations[utils.ChannelTag]) == 0 {
+			klog.Infof("mce cluster %s has no requested channel or user, can't notify", cluster.Name)
+			return
+		}
+		var failedProvisionCondition bool
+		for _, provisionCondition := range clusterDeployment.Status.Conditions {
+			if provisionCondition.Type == hivev1.ProvisionFailedCondition {
+				if provisionCondition.Status == "True" {
+					failedProvisionCondition = true
+				}
+				break
+			}
+		}
+		if !failedProvisionCondition {
+			if clusterProvision != nil {
+				if clusterProvision.Spec.Stage != hivev1.ClusterProvisionStageComplete && clusterProvision.Spec.Stage != hivev1.ClusterProvisionStageFailed {
+					klog.Infof("no credentials or failure, still pending")
+					return
+				}
+			} else {
+				klog.Infof("no credentials or failure, still pending")
+				return
+			}
+		}
+		NotifyMce(s, cluster, clusterDeployment, clusterProvision, kubeconfig, password)
+	}
+}
+
 func NewBot(botToken, botSigningSecret string, graceperiod time.Duration, port int, workflowConfig *manager.WorkflowConfig) *Bot {
 	return &Bot{
 		BotToken:         botToken,
@@ -89,107 +119,107 @@ func (b *Bot) SupportedCommands() []parser.BotCommand {
 				strings.Join(CodeSlice(manager.SupportedParameters), ", ")),
 			Example: "launch 4.17,openshift/installer#7160,openshift/machine-config-operator#3688 gcp,techpreview",
 			Handler: LaunchCluster,
-		}),
+		}, false),
 		parser.NewBotCommand("rosa create <version> <duration>", &parser.CommandDefinition{
 			Description: "Launch an cluster in ROSA. Only GA Openshift versions are supported at the moment.",
 			Example:     "rosa create 4.17 3h",
 			Handler:     RosaCreate,
-		}),
+		}, false),
 		parser.NewBotCommand("rosa lookup <version>", &parser.CommandDefinition{
 			Description: "Find openshift version(s) with provided prefix that is supported in ROSA.",
 			Example:     "rosa lookup 4.17",
 			Handler:     RosaLookup,
-		}),
+		}, false),
 		parser.NewBotCommand("rosa describe <cluster>", &parser.CommandDefinition{
 			Description: "Display the details of the specified ROSA cluster.",
 			Example:     "rosa describe s9h9g-9b6nj-x94",
 			Handler:     RosaDescribe,
-		}),
+		}, false),
 		parser.NewBotCommand("list", &parser.CommandDefinition{
 			Description: "See who is hogging all the clusters.",
 			Handler:     List,
-		}),
+		}, false),
 		parser.NewBotCommand("done", &parser.CommandDefinition{
 			Description: "Terminate the running cluster",
 			Handler:     Done,
-		}),
+		}, false),
 		parser.NewBotCommand("refresh", &parser.CommandDefinition{
 			Description: "If the cluster is currently marked as failed, retry fetching its credentials in case of an error.",
 			Handler:     Refresh,
-		}),
+		}, false),
 		parser.NewBotCommand("auth", &parser.CommandDefinition{
 			Description: "Send the credentials for the cluster you most recently requested",
 			Handler:     Auth,
-		}),
+		}, false),
 		parser.NewBotCommand("test upgrade <from> <to> <options>", &parser.CommandDefinition{
 			Description: fmt.Sprintf("Run the upgrade tests between two release images. The arguments may be a pull spec of a release image or tags from https://amd64.ocp.releases.ci.openshift.org. You may change the upgrade test by passing `test=NAME` in options with one of %s", strings.Join(CodeSlice(manager.SupportedUpgradeTests), ", ")),
 			Example:     "test upgrade 4.16 4.17 aws",
 			Handler:     TestUpgrade,
-		}),
+		}, false),
 		parser.NewBotCommand("test <name> <image_or_version_or_prs> <options>", &parser.CommandDefinition{
 			Description: fmt.Sprintf("Run the requested test suite from an image or release or built PRs. Supported test suites are %s. The from argument may be a pull spec of a release image or tags from https://amd64.ocp.releases.ci.openshift.org. ", strings.Join(CodeSlice(manager.SupportedTests), ", ")),
 			Example:     "test e2e 4.17 vsphere",
 			Handler:     Test,
-		}),
+		}, false),
 		parser.NewBotCommand("build <pullrequest>", &parser.CommandDefinition{
 			Description: "Create a new release image from one or more pull requests. The successful build location will be sent to you when it completes and then preserved for 12 hours.  To obtain a pull secret use `oc registry login --to /path/to/pull-secret` after using `oc login` to login to the relevant CI cluster.",
 			Example:     "build openshift/operator-framework-olm#68,operator-framework/operator-marketplace#396",
 			Handler:     Build,
-		}),
+		}, false),
 		parser.NewBotCommand("workflow-launch <name> <image_or_version_or_prs> <parameters>", &parser.CommandDefinition{
 			Description: "Launch a cluster using the requested workflow from an image or release or built PRs. The from argument may be a pull spec of a release image or tags from https://amd64.ocp.releases.ci.openshift.org.",
 			Example:     "workflow-launch openshift-e2e-gcp-windows-node 4.17 gcp",
 			Handler:     WorkflowLaunch,
-		}),
+		}, false),
 		parser.NewBotCommand("workflow-test <name> <image_or_version_or_prs> <parameters>", &parser.CommandDefinition{
 			Description: "Start the test using the requested workflow from an image or release or built PRs. The from argument may be a pull spec of a release image or tags from https://amd64.ocp.releases.ci.openshift.org.",
 			Example:     "workflow-test openshift-e2e-gcp 4.17",
 			Handler:     WorkflowTest,
-		}),
+		}, false),
 		parser.NewBotCommand("workflow-upgrade <name> <from_image_or_version_or_prs> <to_image_or_version_or_prs> <parameters>", &parser.CommandDefinition{
 			Description: "Run a custom upgrade using the requested workflow from an image or release or built PRs to a specified version/image/pr from https://amd64.ocp.releases.ci.openshift.org. ",
 			Example:     "workflow-upgrade openshift-upgrade-azure-ovn 4.16 4.17 azure",
 			Handler:     WorkflowUpgrade,
-		}),
+		}, false),
 		parser.NewBotCommand("version", &parser.CommandDefinition{
 			Description: "Report the version of the bot",
 			Handler:     Version,
-		}),
+		}, false),
 		parser.NewBotCommand("lookup <image_or_version_or_prs> <architecture>", &parser.CommandDefinition{
 			Description: "Get info about a version.",
 			Example:     "lookup 4.17 arm64",
 			Handler:     Lookup,
-		}),
+		}, false),
 		parser.NewBotCommand("catalog build <pullrequest> <bundle_name>", &parser.CommandDefinition{
 			Description: "Create an operator, bundle, and catalog from a pull request. The successful build location will be sent to you when it completes and then preserved for 12 hours.  To obtain a pull secret use `oc registry login --to /path/to/pull-secret` after using `oc login` to login to the relevant CI cluster.",
 			Example:     "catalog build openshift/aws-efs-csi-driver-operator#75 aws-efs-csi-driver-operator-bundle",
 			Handler:     CatalogBuild,
-		}),
-		parser.NewBotCommand("mce create <imageset> <duration>", &parser.CommandDefinition{
+		}, false),
+		parser.NewBotCommand("mce create <imageset> <duration> <platform>", &parser.CommandDefinition{
 			Description: "Create a new cluster using Hive and MCE.",
-			Example:     "mce create img4.16.7-multi-appsub 6h",
+			Example:     "mce create img4.16.7-multi-appsub 6h aws",
 			Handler:     MceCreate,
-		}),
-		parser.NewBotCommand("mce auth <cluster_name>", &parser.CommandDefinition{
+		}, false),
+		parser.NewBotCommand("mce auth <name>", &parser.CommandDefinition{
 			Description: "Print kubeconfig and kubeadmin password for specified MCE cluster.",
 			Example:     "mce auth mycluster",
 			Handler:     MceAuth,
-		}),
+		}, true),
 		parser.NewBotCommand("mce delete <cluster_name>", &parser.CommandDefinition{
 			Description: "Delete a previously created MCE cluster.",
 			Example:     "mce delete mycluster",
 			Handler:     MceDelete,
-		}),
+		}, true),
 		parser.NewBotCommand("mce list", &parser.CommandDefinition{
 			Description: "List active MCE clusters.",
 			Example:     "mce list",
 			Handler:     MceList,
-		}),
+		}, true),
 		parser.NewBotCommand("mce imagesets", &parser.CommandDefinition{
 			Description: "List available imagesets for MCE clusters.",
 			Example:     "mce list",
 			Handler:     MceImageSets,
-		}),
+		}, true),
 	}
 }
 
@@ -526,7 +556,7 @@ func ParseOptions(options string, inputs [][]string, jobType manager.JobType) (s
 	return platform, architecture, params, nil
 }
 
-func NotifyMce(client *slack.Client, cluster *clusterv1.ManagedCluster, clusterDeployment *hivev1.ClusterDeployment, kubeconfig, password string) {
+func NotifyMce(client *slack.Client, cluster *clusterv1.ManagedCluster, clusterDeployment *hivev1.ClusterDeployment, clusterProvision *hivev1.ClusterProvision, kubeconfig, password string) {
 	channel := cluster.Annotations[utils.ChannelTag]
 	var availability string
 	for _, condition := range cluster.Status.Conditions {
@@ -534,22 +564,42 @@ func NotifyMce(client *slack.Client, cluster *clusterv1.ManagedCluster, clusterD
 			availability = string(condition.Status)
 		}
 	}
+	if clusterProvision != nil && clusterProvision.Spec.Stage == "Failed" {
+		failedCondition := hivev1.ClusterProvisionCondition{}
+		for _, condition := range clusterProvision.Status.Conditions {
+			if condition.ConditionType() == hivev1.ClusterProvisionFailedCondition {
+				failedCondition = condition
+			}
+		}
+		message := fmt.Sprintf("your cluster (name: `%s`) has failed to provision. Reason for failure is: `%s`. Error message is:\n```%s```", cluster.GetName(), failedCondition.Reason, failedCondition.Message)
+		if _, _, err := client.PostMessage(channel, slack.MsgOptionText(message, false)); err != nil {
+			klog.Warningf("Failed to post the message: %s\nto the channel: %s.", message, channel)
+		}
+		return
+	}
+	// in some cases, an early provisioning fail may result in a ClusterProvision not being created
+	for _, provisionCondition := range clusterDeployment.Status.Conditions {
+		if provisionCondition.Type == hivev1.ProvisionFailedCondition {
+			if provisionCondition.Status == "True" {
+				message := fmt.Sprintf("your cluster (name: `%s`) has failed to provision. Reason for failure is: `%s`.  Error message is:\n```%s```", cluster.GetName(), provisionCondition.Reason, provisionCondition.Message)
+				if _, _, err := client.PostMessage(channel, slack.MsgOptionText(message, false)); err != nil {
+					klog.Warningf("Failed to post the message: %s\nto the channel: %s.", message, channel)
+				}
+				return
+			}
+			break
+		}
+	}
 	if availability == "True" {
 		message := fmt.Sprintf("your cluster (name: `%s`) is ready", cluster.GetName())
-		expiryTime, err := base64.RawStdEncoding.DecodeString(cluster.Annotations[utils.ExpiryTimeTag])
-		if err != nil {
-			klog.Errorf("Failed to base64 decode expiry time tag: %v", err)
-			message += "."
-		} else if parsedExpiryTime, err := time.Parse(time.RFC3339, string(expiryTime)); err != nil {
+		expiryTime := cluster.Annotations[utils.ExpiryTimeTag]
+		if parsedExpiryTime, err := time.Parse(time.RFC3339, string(expiryTime)); err != nil {
 			klog.Errorf("Failed to parse expiry time: %v", err)
 			message += "."
 		} else {
 			message += fmt.Sprintf(", it will be shut down automatically in ~%d minutes.", time.Until(parsedExpiryTime)/time.Minute)
 		}
-		requestTime, err := base64.RawStdEncoding.DecodeString(cluster.Annotations[utils.RequestTimeTag])
-		if err != nil {
-			klog.Errorf("Failed to base64 decode request time tag: %v", err)
-		}
+		requestTime := cluster.Annotations[utils.RequestTimeTag]
 		parsedRequestTime, err := time.Parse(time.RFC3339, string(requestTime))
 		if err != nil {
 			// fall back to current time if parse fails

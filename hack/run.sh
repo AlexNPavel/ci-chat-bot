@@ -15,6 +15,7 @@ trap 'rm -rf $tmp_dir' EXIT
 oc --context app.ci -n ci extract secrets/ci-chat-bot-kubeconfigs --to=${tmp_kube} --confirm
 oc --context app.ci -n ci get secrets boskos-credentials -ogo-template={{.data.credentials}} | base64 -d > $tmp_boskos
 oc --context app.ci -n ci get secrets ci-chat-bot-slack-app --template='{{index .data "rosa-subnet-ids"}}' | base64 -d > $tmp_subnets
+cp /tmp/{sa.ci-chat-bot-mce.dpcr.config,sa.ci-chat-bot-mce.dpcr.token.txt} ${tmp_kube}
 
 work_dir=$(readlink -f $(dirname $0)/..)
 make

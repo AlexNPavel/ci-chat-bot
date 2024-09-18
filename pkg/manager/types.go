@@ -228,6 +228,7 @@ type jobManager struct {
 		lock               sync.RWMutex
 		clusters           map[string]*clusterv1.ManagedCluster
 		deployments        map[string]*hivev1.ClusterDeployment
+		provisions         map[string]*hivev1.ClusterProvision
 		clusterKubeconfigs map[string]string
 		clusterPasswords   map[string]string
 		imagesets          sets.Set[string]
@@ -275,6 +276,7 @@ type JobType string
 type JobManager interface {
 	SetNotifier(JobCallbackFunc)
 	SetRosaNotifier(RosaCallbackFunc)
+	SetMceNotifier(MCECallbackFunc)
 
 	LaunchJobForUser(req *JobRequest) (string, error)
 	CreateRosaCluster(user, channel, version string, duration time.Duration) (string, error)
@@ -293,9 +295,10 @@ type JobManager interface {
 
 	CreateMceCluster(user, channel, platform, imageset string, duration time.Duration) (string, error)
 	DeleteMceCluster(user, clusterName string) (string, error)
-	GetManagedClustersForUser(user string) (map[string]*clusterv1.ManagedCluster, map[string]*hivev1.ClusterDeployment, map[string]string, map[string]string)
+	GetManagedClustersForUser(user string) (map[string]*clusterv1.ManagedCluster, map[string]*hivev1.ClusterDeployment, map[string]*hivev1.ClusterProvision, map[string]string, map[string]string)
 	ListManagedClusters() string
 	ListImagesets() string
+	GetMceUserConfig() *MceConfig
 }
 
 // JobCallbackFunc is invoked when the job changes state in a significant
@@ -308,7 +311,7 @@ type RosaCallbackFunc func(*clustermgmtv1.Cluster, string)
 
 // RosaCallbackFunc is invoked when the rosa cluster changes state in a significant
 // way. Takes the ManagedCluster object, kubeconfig, and admin password.
-type MCECallbackFunc func(*clusterv1.ManagedCluster, string, string)
+type MCECallbackFunc func(*clusterv1.ManagedCluster, *hivev1.ClusterDeployment, *hivev1.ClusterProvision, string, string)
 
 // JobInput defines the input to a job. Different modes need different inputs.
 type JobInput struct {
@@ -391,4 +394,5 @@ type MceUser struct {
 	AwsBaseDomain string `yaml:"aws_base_domain,omitempty"`
 	GcpSecret     string `yaml:"gcp_secret,omitempty"`
 	GcpBaseDomain string `yaml:"gcp_base_domain,omitempty"`
+	GcpProjectID  string `yaml:"gcp_project_id,omitempty"`
 }
