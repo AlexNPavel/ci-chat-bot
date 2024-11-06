@@ -155,7 +155,6 @@ type ViewResponse struct {
 }
 
 // OpenView opens a view for a user.
-// For more information see the OpenViewContext documentation.
 func (api *Client) OpenView(triggerID string, view ModalViewRequest) (*ViewResponse, error) {
 	return api.OpenViewContext(context.Background(), triggerID, view)
 }
@@ -178,7 +177,6 @@ func ValidateUniqueBlockID(view ModalViewRequest) bool {
 }
 
 // OpenViewContext opens a view for a user with a custom context.
-// Slack API docs: https://api.slack.com/methods/views.open
 func (api *Client) OpenViewContext(
 	ctx context.Context,
 	triggerID string,
@@ -210,13 +208,11 @@ func (api *Client) OpenViewContext(
 }
 
 // PublishView publishes a static view for a user.
-// For more information see the PublishViewContext documentation.
 func (api *Client) PublishView(userID string, view HomeTabViewRequest, hash string) (*ViewResponse, error) {
 	return api.PublishViewContext(context.Background(), userID, view, hash)
 }
 
 // PublishViewContext publishes a static view for a user with a custom context.
-// Slack API docs: https://api.slack.com/methods/views.publish
 func (api *Client) PublishViewContext(
 	ctx context.Context,
 	userID string,
@@ -245,13 +241,11 @@ func (api *Client) PublishViewContext(
 }
 
 // PushView pushes a view onto the stack of a root view.
-// For more information see the PushViewContext documentation.
 func (api *Client) PushView(triggerID string, view ModalViewRequest) (*ViewResponse, error) {
 	return api.PushViewContext(context.Background(), triggerID, view)
 }
 
-// PushViewContext pushes a view onto the stack of a root view with a custom context.
-// Slack API docs: https://api.slack.com/methods/views.push
+// PublishViewContext pushes a view onto the stack of a root view with a custom context.
 func (api *Client) PushViewContext(
 	ctx context.Context,
 	triggerID string,
@@ -278,13 +272,11 @@ func (api *Client) PushViewContext(
 }
 
 // UpdateView updates an existing view.
-// For more information see the UpdateViewContext documentation.
 func (api *Client) UpdateView(view ModalViewRequest, externalID, hash, viewID string) (*ViewResponse, error) {
 	return api.UpdateViewContext(context.Background(), view, externalID, hash, viewID)
 }
 
 // UpdateViewContext updates an existing view with a custom context.
-// Slack API docs: https://api.slack.com/methods/views.update
 func (api *Client) UpdateViewContext(
 	ctx context.Context,
 	view ModalViewRequest,

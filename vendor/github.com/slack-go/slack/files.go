@@ -11,7 +11,7 @@ import (
 )
 
 const (
-	// Add here the defaults in the site
+	// Add here the defaults in the siten
 	DEFAULT_FILES_USER        = ""
 	DEFAULT_FILES_CHANNEL     = ""
 	DEFAULT_FILES_TS_FROM     = 0
@@ -129,7 +129,6 @@ type FileUploadParameters struct {
 type GetFilesParameters struct {
 	User          string
 	Channel       string
-	TeamID        string
 	TimestampFrom JSONTime
 	TimestampTo   JSONTime
 	Types         string
@@ -143,7 +142,6 @@ type ListFilesParameters struct {
 	Limit   int
 	User    string
 	Channel string
-	TeamID  string
 	Types   string
 	Cursor  string
 }
@@ -234,14 +232,12 @@ func (api *Client) fileRequest(ctx context.Context, path string, values url.Valu
 	return response, response.Err()
 }
 
-// GetFileInfo retrieves a file and related comments.
-// For more details, see GetFileInfoContext documentation.
+// GetFileInfo retrieves a file and related comments
 func (api *Client) GetFileInfo(fileID string, count, page int) (*File, []Comment, *Paging, error) {
 	return api.GetFileInfoContext(context.Background(), fileID, count, page)
 }
 
-// GetFileInfoContext retrieves a file and related comments with a custom context.
-// Slack API docs: https://api.slack.com/methods/files.info
+// GetFileInfoContext retrieves a file and related comments with a custom context
 func (api *Client) GetFileInfoContext(ctx context.Context, fileID string, count, page int) (*File, []Comment, *Paging, error) {
 	values := url.Values{
 		"token": {api.token},
@@ -257,25 +253,24 @@ func (api *Client) GetFileInfoContext(ctx context.Context, fileID string, count,
 	return &response.File, response.Comments, &response.Paging, nil
 }
 
-// GetFile retrieves a given file from its private download URL.
+// GetFile retreives a given file from its private download URL
 func (api *Client) GetFile(downloadURL string, writer io.Writer) error {
 	return api.GetFileContext(context.Background(), downloadURL, writer)
 }
 
-// GetFileContext retrieves a given file from its private download URL with a custom context.
+// GetFileContext retreives a given file from its private download URL with a custom context
+//
 // For more details, see GetFile documentation.
 func (api *Client) GetFileContext(ctx context.Context, downloadURL string, writer io.Writer) error {
 	return downloadFile(ctx, api.httpclient, api.token, downloadURL, writer, api)
 }
 
-// GetFiles retrieves all files according to the parameters given.
-// For more details, see GetFilesContext documentation.
+// GetFiles retrieves all files according to the parameters given
 func (api *Client) GetFiles(params GetFilesParameters) ([]File, *Paging, error) {
 	return api.GetFilesContext(context.Background(), params)
 }
 
-// GetFilesContext retrieves all files according to the parameters given with a custom context.
-// Slack API docs: https://api.slack.com/methods/files.list
+// GetFilesContext retrieves all files according to the parameters given with a custom context
 func (api *Client) GetFilesContext(ctx context.Context, params GetFilesParameters) ([]File, *Paging, error) {
 	values := url.Values{
 		"token": {api.token},
@@ -285,9 +280,6 @@ func (api *Client) GetFilesContext(ctx context.Context, params GetFilesParameter
 	}
 	if params.Channel != DEFAULT_FILES_CHANNEL {
 		values.Add("channel", params.Channel)
-	}
-	if params.TeamID != "" {
-		values.Add("team_id", params.TeamID)
 	}
 	if params.TimestampFrom != DEFAULT_FILES_TS_FROM {
 		values.Add("ts_from", strconv.FormatInt(int64(params.TimestampFrom), 10))
@@ -316,13 +308,13 @@ func (api *Client) GetFilesContext(ctx context.Context, params GetFilesParameter
 }
 
 // ListFiles retrieves all files according to the parameters given. Uses cursor based pagination.
-// For more details, see ListFilesContext documentation.
 func (api *Client) ListFiles(params ListFilesParameters) ([]File, *ListFilesParameters, error) {
 	return api.ListFilesContext(context.Background(), params)
 }
 
 // ListFilesContext retrieves all files according to the parameters given with a custom context.
-// Slack API docs: https://api.slack.com/methods/files.list
+//
+// For more details, see ListFiles documentation.
 func (api *Client) ListFilesContext(ctx context.Context, params ListFilesParameters) ([]File, *ListFilesParameters, error) {
 	values := url.Values{
 		"token": {api.token},
@@ -333,9 +325,6 @@ func (api *Client) ListFilesContext(ctx context.Context, params ListFilesParamet
 	}
 	if params.Channel != DEFAULT_FILES_CHANNEL {
 		values.Add("channel", params.Channel)
-	}
-	if params.TeamID != "" {
-		values.Add("team_id", params.TeamID)
 	}
 	if params.Limit != DEFAULT_FILES_COUNT {
 		values.Add("limit", strconv.Itoa(params.Limit))
@@ -354,18 +343,12 @@ func (api *Client) ListFilesContext(ctx context.Context, params ListFilesParamet
 	return response.Files, &params, nil
 }
 
-// UploadFile uploads a file.
-//
-// Deprecated: Use [Client.UploadFileV2] instead. This will stop functioning on March 11, 2025.
-// For more details, see: https://api.slack.com/methods/files.upload#markdown
+// UploadFile uploads a file
 func (api *Client) UploadFile(params FileUploadParameters) (file *File, err error) {
 	return api.UploadFileContext(context.Background(), params)
 }
 
-// UploadFileContext uploads a file and setting a custom context.
-//
-// Deprecated: Use [Client.UploadFileV2Context] instead. This will stop functioning on March 11, 2025.
-// For more details, see: https://api.slack.com/methods/files.upload#markdown
+// UploadFileContext uploads a file and setting a custom context
 func (api *Client) UploadFileContext(ctx context.Context, params FileUploadParameters) (file *File, err error) {
 	// Test if user token is valid. This helps because client.Do doesn't like this for some reason. XXX: More
 	// investigation needed, but for now this will do.
@@ -413,14 +396,12 @@ func (api *Client) UploadFileContext(ctx context.Context, params FileUploadParam
 	return &response.File, response.Err()
 }
 
-// DeleteFileComment deletes a file's comment.
-// For more details, see DeleteFileCommentContext documentation.
+// DeleteFileComment deletes a file's comment
 func (api *Client) DeleteFileComment(commentID, fileID string) error {
 	return api.DeleteFileCommentContext(context.Background(), fileID, commentID)
 }
 
-// DeleteFileCommentContext deletes a file's comment with a custom context.
-// Slack API docs: https://api.slack.com/methods/files.comments.delete
+// DeleteFileCommentContext deletes a file's comment with a custom context
 func (api *Client) DeleteFileCommentContext(ctx context.Context, fileID, commentID string) (err error) {
 	if fileID == "" || commentID == "" {
 		return ErrParametersMissing
@@ -435,14 +416,12 @@ func (api *Client) DeleteFileCommentContext(ctx context.Context, fileID, comment
 	return err
 }
 
-// DeleteFile deletes a file.
-// For more details, see DeleteFileContext documentation.
+// DeleteFile deletes a file
 func (api *Client) DeleteFile(fileID string) error {
 	return api.DeleteFileContext(context.Background(), fileID)
 }
 
-// DeleteFileContext deletes a file with a custom context.
-// Slack API docs: https://api.slack.com/methods/files.delete
+// DeleteFileContext deletes a file with a custom context
 func (api *Client) DeleteFileContext(ctx context.Context, fileID string) (err error) {
 	values := url.Values{
 		"token": {api.token},
@@ -453,14 +432,12 @@ func (api *Client) DeleteFileContext(ctx context.Context, fileID string) (err er
 	return err
 }
 
-// RevokeFilePublicURL disables public/external sharing for a file.
-// For more details, see RevokeFilePublicURLContext documentation.
+// RevokeFilePublicURL disables public/external sharing for a file
 func (api *Client) RevokeFilePublicURL(fileID string) (*File, error) {
 	return api.RevokeFilePublicURLContext(context.Background(), fileID)
 }
 
-// RevokeFilePublicURLContext disables public/external sharing for a file with a custom context.
-// Slack API docs: https://api.slack.com/methods/files.revokePublicURL
+// RevokeFilePublicURLContext disables public/external sharing for a file with a custom context
 func (api *Client) RevokeFilePublicURLContext(ctx context.Context, fileID string) (*File, error) {
 	values := url.Values{
 		"token": {api.token},
@@ -474,14 +451,12 @@ func (api *Client) RevokeFilePublicURLContext(ctx context.Context, fileID string
 	return &response.File, nil
 }
 
-// ShareFilePublicURL enabled public/external sharing for a file.
-// For more details, see ShareFilePublicURLContext documentation.
+// ShareFilePublicURL enabled public/external sharing for a file
 func (api *Client) ShareFilePublicURL(fileID string) (*File, []Comment, *Paging, error) {
 	return api.ShareFilePublicURLContext(context.Background(), fileID)
 }
 
-// ShareFilePublicURLContext enabled public/external sharing for a file with a custom context.
-// Slack API docs: https://api.slack.com/methods/files.sharedPublicURL
+// ShareFilePublicURLContext enabled public/external sharing for a file with a custom context
 func (api *Client) ShareFilePublicURLContext(ctx context.Context, fileID string) (*File, []Comment, *Paging, error) {
 	values := url.Values{
 		"token": {api.token},
@@ -495,7 +470,7 @@ func (api *Client) ShareFilePublicURLContext(ctx context.Context, fileID string)
 	return &response.File, response.Comments, &response.Paging, nil
 }
 
-// getUploadURLExternal gets a URL and fileID from slack which can later be used to upload a file.
+// getUploadURLExternal gets a URL and fileID from slack which can later be used to upload a file
 func (api *Client) getUploadURLExternal(ctx context.Context, params getUploadURLExternalParameters) (*getUploadURLExternalResponse, error) {
 	values := url.Values{
 		"token":    {api.token},
@@ -521,8 +496,9 @@ func (api *Client) getUploadURLExternal(ctx context.Context, params getUploadURL
 func (api *Client) uploadToURL(ctx context.Context, params uploadToURLParameters) (err error) {
 	values := url.Values{}
 	if params.Content != "" {
-		contentReader := strings.NewReader(params.Content)
-		err = postWithMultipartResponse(ctx, api.httpclient, params.UploadURL, params.Filename, "file", api.token, values, contentReader, nil, api)
+		values.Add("content", params.Content)
+		values.Add("token", api.token)
+		err = postForm(ctx, api.httpclient, params.UploadURL, values, nil, api)
 	} else if params.File != "" {
 		err = postLocalWithMultipartResponse(ctx, api.httpclient, params.UploadURL, params.File, "file", api.token, values, nil, api)
 	} else if params.Reader != nil {
@@ -539,13 +515,11 @@ func (api *Client) completeUploadExternal(ctx context.Context, fileID string, pa
 		return nil, err
 	}
 	values := url.Values{
-		"token": {api.token},
-		"files": {string(requestBytes)},
+		"token":      {api.token},
+		"files":      {string(requestBytes)},
+		"channel_id": {params.channel},
 	}
 
-	if params.channel != "" {
-		values.Add("channel_id", params.channel)
-	}
 	if params.initialComment != "" {
 		values.Add("initial_comment", params.initialComment)
 	}
@@ -563,18 +537,18 @@ func (api *Client) completeUploadExternal(ctx context.Context, fileID string, pa
 	return response, nil
 }
 
-// UploadFileV2 uploads file to a given slack channel using 3 steps.
-// For more details, see UploadFileV2Context documentation.
+// UploadFileV2 uploads file to a given slack channel using 3 steps -
+//  1. Get an upload URL using files.getUploadURLExternal API
+//  2. Send the file as a post to the URL provided by slack
+//  3. Complete the upload and share it to the specified channel using files.completeUploadExternal
 func (api *Client) UploadFileV2(params UploadFileV2Parameters) (*FileSummary, error) {
 	return api.UploadFileV2Context(context.Background(), params)
 }
 
-// UploadFileV2Context uploads file to a given slack channel using 3 steps -
+// UploadFileV2 uploads file to a given slack channel using 3 steps with a custom context -
 //  1. Get an upload URL using files.getUploadURLExternal API
 //  2. Send the file as a post to the URL provided by slack
 //  3. Complete the upload and share it to the specified channel using files.completeUploadExternal
-//
-// Slack Docs: https://api.slack.com/messaging/files#uploading_files
 func (api *Client) UploadFileV2Context(ctx context.Context, params UploadFileV2Parameters) (file *FileSummary, err error) {
 	if params.Filename == "" {
 		return nil, fmt.Errorf("file.upload.v2: filename cannot be empty")
@@ -582,7 +556,9 @@ func (api *Client) UploadFileV2Context(ctx context.Context, params UploadFileV2P
 	if params.FileSize == 0 {
 		return nil, fmt.Errorf("file.upload.v2: file size cannot be 0")
 	}
-
+	if params.Channel == "" {
+		return nil, fmt.Errorf("file.upload.v2: channel cannot be empty")
+	}
 	u, err := api.getUploadURLExternal(ctx, getUploadURLExternalParameters{
 		altText:     params.AltTxt,
 		fileName:    params.Filename,

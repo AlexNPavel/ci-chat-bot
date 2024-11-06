@@ -22,14 +22,12 @@ func (api *Client) authRequest(ctx context.Context, path string, values url.Valu
 	return response, response.Err()
 }
 
-// SendAuthRevoke will send a revocation for our token.
-// For more details, see SendAuthRevokeContext documentation.
+// SendAuthRevoke will send a revocation for our token
 func (api *Client) SendAuthRevoke(token string) (*AuthRevokeResponse, error) {
 	return api.SendAuthRevokeContext(context.Background(), token)
 }
 
-// SendAuthRevokeContext will send a revocation request for our token to api.revoke with a custom context.
-// Slack API docs: https://api.slack.com/methods/auth.revoke
+// SendAuthRevokeContext will send a revocation request for our token to api.revoke with context
 func (api *Client) SendAuthRevokeContext(ctx context.Context, token string) (*AuthRevokeResponse, error) {
 	if token == "" {
 		token = api.token
@@ -52,13 +50,12 @@ type ListTeamsParameters struct {
 }
 
 // ListTeams returns all workspaces a token can access.
-// For more details, see ListTeamsContext documentation.
+// More info: https://api.slack.com/methods/admin.teams.list
 func (api *Client) ListTeams(params ListTeamsParameters) ([]Team, string, error) {
 	return api.ListTeamsContext(context.Background(), params)
 }
 
-// ListTeamsContext returns all workspaces a token can access with a custom context.
-// Slack API docs: https://api.slack.com/methods/auth.teams.list
+// ListTeams returns all workspaces a token can access with a custom context.
 func (api *Client) ListTeamsContext(ctx context.Context, params ListTeamsParameters) ([]Team, string, error) {
 	values := url.Values{
 		"token": {api.token},
