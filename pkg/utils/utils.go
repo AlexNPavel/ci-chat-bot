@@ -20,6 +20,7 @@ import (
 
 var LaunchLabel = "ci-chat-bot.openshift.io/launch"
 
+const BaseDomain = "ci-chat-bot/base-domain"
 const CoreOSURL = "https://coreos.slack.com"
 const UserTag = "ci-chat-bot/user"
 const ChannelTag = "ci-chat-bot/channel"

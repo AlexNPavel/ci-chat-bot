@@ -198,7 +198,7 @@ func (b *Bot) SupportedCommands() []parser.BotCommand {
 			Example:     "catalog build openshift/aws-efs-csi-driver-operator#75 aws-efs-csi-driver-operator-bundle",
 			Handler:     CatalogBuild,
 		}, false),
-		parser.NewBotCommand("mce create <version> <duration> <platform>", &parser.CommandDefinition{
+		parser.NewBotCommand("mce create <image_or_version_or_prs> <duration> <platform>", &parser.CommandDefinition{
 			Description: "Create a new cluster using Hive and MCE.",
 			Example:     "mce create 4.16.7 6h aws",
 			Handler:     MceCreate,

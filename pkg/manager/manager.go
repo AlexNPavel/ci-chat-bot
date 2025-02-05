@@ -88,6 +88,7 @@ const (
 	JobTypeWorkflowLaunch  = "workflow-launch"
 	JobTypeWorkflowTest    = "workflow-test"
 	JobTypeWorkflowUpgrade = "workflow-upgrade"
+	JobTypeMCECustomImage  = "mce-custom-image"
 )
 
 var CurrentRelease = semver.Version{
@@ -681,6 +682,7 @@ func (m *jobManager) sync() error {
 				HasIndex:   hasIndex,
 				BundleName: job.Annotations["ci-chat-bot.openshift.io/OperatorBundleName"],
 			},
+			ManagedClusterName: job.Annotations["ci-chat-bot.openshift.io/managedClusterName"],
 		}
 
 		var err error
@@ -718,8 +720,45 @@ func (m *jobManager) sync() error {
 			j.Failure = ""
 
 			m.jobs[job.Name] = j
-			if previous == nil || previous.State != j.State {
+			if (previous == nil || previous.State != j.State) && j.ManagedClusterName == "" {
 				go m.finishedJob(*j)
+			} else if j.ManagedClusterName != "" {
+				m.mceClusters.lock.RLock()
+				if mCluster, ok := m.mceClusters.clusters[j.ManagedClusterName]; ok {
+					if _, ok := m.mceClusters.deployments[j.ManagedClusterName]; ok {
+						// deployment already exists; ignore
+						m.mceClusters.lock.RUnlock()
+						break
+					}
+					platform := ""
+					switch mCluster.Labels["Cloud"] {
+					case "Amazon":
+						platform = "aws"
+					case "Google":
+						platform = "gcp"
+					}
+					ciOpNamespace, ok := job.Annotations["ci-chat-bot.openshift.io/ns"]
+					if !ok {
+						// TODO: Notify user of failure and delete MCE resources
+						klog.Errorf("Could not identify ci-operator namespace for job %s", job.Name)
+						m.mceClusters.lock.RUnlock()
+						break
+					}
+					registryURL := fmt.Sprintf("registry.%s.ci.openshift.org/%s/release:latest", j.BuildCluster, ciOpNamespace)
+					if err := m.createCustomImageset(registryURL, j.ManagedClusterName); err != nil {
+						// TODO: Notify user of failure and delete MCE resources
+						klog.Errorf("Failed to create cluster imageset: %v", err)
+						m.mceClusters.lock.RUnlock()
+						break
+					}
+					klog.Infof("Created imageset %s pointing to %s", j.ManagedClusterName, registryURL)
+					if err := m.createClusterDeployment(j.ManagedClusterName, j.ManagedClusterName, mCluster.Annotations[utils.BaseDomain], platform); err != nil {
+						// TODO: Notify user of failure and delete MCE resources
+						klog.Errorf("Failed to create cluster deployment: %v", err)
+					}
+					klog.Infof("Created cluster deployment %s", j.ManagedClusterName)
+				}
+				m.mceClusters.lock.RUnlock()
 			}
 
 		case prowapiv1.TriggeredState, prowapiv1.PendingState, "":
@@ -1496,6 +1535,8 @@ func (m *jobManager) resolveToJob(req *JobRequest) (*Job, error) {
 
 		Architecture: req.Architecture,
 		WorkflowName: req.WorkflowName,
+
+		ManagedClusterName: req.ManagedClusterName,
 	}
 
 	jobInputs, _, err := m.lookupInputs(req.Inputs, job.Architecture)
@@ -1524,6 +1565,20 @@ func (m *jobManager) resolveToJob(req *JobRequest) (*Job, error) {
 	}
 
 	switch req.Type {
+	case JobTypeMCECustomImage: // currently identical to JobTypeBuild
+		if req.Architecture != "amd64" {
+			return nil, fmt.Errorf("builds are not currently supported for non-amd64 releases")
+		}
+		var prs int
+		for _, input := range jobInputs {
+			for _, ref := range input.Refs {
+				prs += len(ref.Pulls)
+			}
+		}
+		if len(jobInputs) != 1 {
+			return nil, fmt.Errorf("at least one input is required to build a release image")
+		}
+		job.Mode = JobTypeMCECustomImage
 	case JobTypeBuild:
 		if req.Architecture != "amd64" {
 			return nil, fmt.Errorf("builds are not currently supported for non-amd64 releases")
@@ -1648,7 +1703,7 @@ func multistageParamsForPlatform(platform string) sets.Set[string] {
 }
 
 func multistageNameFromParams(params map[string]string, platform, jobType string) (string, error) {
-	if jobType == JobTypeWorkflowLaunch || jobType == JobTypeBuild || jobType == JobTypeCatalog {
+	if jobType == JobTypeWorkflowLaunch || jobType == JobTypeBuild || jobType == JobTypeCatalog || jobType == JobTypeMCECustomImage {
 		return "launch", nil
 	}
 	if jobType == JobTypeWorkflowUpgrade {
@@ -2164,8 +2219,12 @@ func UseSpotInstances(job *Job) bool {
 	return job.Mode == JobTypeLaunch && len(job.JobParams) == 0 && (job.Platform == "aws" || job.Platform == "aws-2")
 }
 
-func (m *jobManager) CreateMceCluster(user, channel, platform, version string, duration time.Duration) (string, error) {
-	imageset := fmt.Sprintf("img%s-multi-appsub", version)
+func (m *jobManager) CreateMceCluster(user, channel, platform string, from [][]string, duration time.Duration) (string, error) {
+	imageset := ""
+	if len(from) > 0 && len(from[0]) == 1 {
+		imageset = fmt.Sprintf("img%s-multi-appsub", from)
+	}
+	var req JobRequest
 	if err := func() error {
 		m.mceConfig.Mutex.RLock()
 		// this section is nested to allow the defer to be executed before calling the createManagedCluster function
@@ -2187,13 +2246,21 @@ func (m *jobManager) CreateMceCluster(user, channel, platform, version string, d
 			return fmt.Errorf("%s is not a supported platform for MCE.", platform)
 		}
 		if !m.mceClusters.imagesets.Has(imageset) {
-			return fmt.Errorf("Imageset %s not found", imageset)
+			// user is requesting a non-GA release or PR; create a job request to generate the requested images/release
+			req = JobRequest{
+				User:         user,
+				Inputs:       from,
+				Type:         JobTypeMCECustomImage,
+				Platform:     platform,
+				RequestedAt:  time.Now(),
+				Architecture: "amd64",
+			}
 		}
 		return nil
 	}(); err != nil {
 		return "", err
 	}
-	cluster, err := m.createManagedCluster(imageset, platform, user, channel, duration)
+	cluster, err := m.createManagedCluster(imageset, platform, user, channel, &req, duration)
 	if err != nil {
 		return "", fmt.Errorf("Failed to create cluster: %v", err)
 	}
