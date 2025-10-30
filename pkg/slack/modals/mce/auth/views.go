@@ -9,17 +9,15 @@ func View() slackClient.ModalViewRequest {
 	return slackClient.ModalViewRequest{
 		Type:            slackClient.VTModal,
 		PrivateMetadata: modals.CallbackDataToMetadata(modals.CallbackData{}, identifier),
-		Title:           &slackClient.TextBlockObject{Type: slackClient.PlainTextType, Text: "MCE Authentication"},
-		Close:           &slackClient.TextBlockObject{Type: slackClient.PlainTextType, Text: "Cancel"},
-		Submit:          &slackClient.TextBlockObject{Type: slackClient.PlainTextType, Text: "Submit"},
+		Title:           slackClient.NewTextBlockObject(slackClient.PlainTextType, "MCE Authentication", false, false),
+		Close:           slackClient.NewTextBlockObject(slackClient.PlainTextType, "Cancel", false, false),
+		Submit:          slackClient.NewTextBlockObject(slackClient.PlainTextType, "Submit", false, false),
 		Blocks: slackClient.Blocks{BlockSet: []slackClient.Block{
-			&slackClient.SectionBlock{
-				Type: slackClient.MBTSection,
-				Text: &slackClient.TextBlockObject{
-					Type: slackClient.MarkdownType,
-					Text: "Click submit to retrieve the credentials for you MCE cluster",
-				},
-			},
+			slackClient.NewSectionBlock(
+				slackClient.NewTextBlockObject(slackClient.MarkdownType, "Click submit to retrieve the credentials for you MCE cluster", false, false),
+				nil,
+				nil,
+			),
 		}},
 	}
 }

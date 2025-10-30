@@ -8,16 +8,14 @@ import (
 func ResultView(msg string) slackClient.ModalViewRequest {
 	return slackClient.ModalViewRequest{
 		Type:  slackClient.VTModal,
-		Title: &slackClient.TextBlockObject{Type: slackClient.PlainTextType, Text: "Refresh the Status"},
-		Close: &slackClient.TextBlockObject{Type: slackClient.PlainTextType, Text: "Close"},
+		Title: slackClient.NewTextBlockObject(slackClient.PlainTextType, "Refresh the Status", false, false),
+		Close: slackClient.NewTextBlockObject(slackClient.PlainTextType, "Close", false, false),
 		Blocks: slackClient.Blocks{BlockSet: []slackClient.Block{
-			&slackClient.SectionBlock{
-				Type: slackClient.MBTSection,
-				Text: &slackClient.TextBlockObject{
-					Type: slackClient.MarkdownType,
-					Text: msg,
-				},
-			},
+			slackClient.NewSectionBlock(
+				slackClient.NewTextBlockObject(slackClient.MarkdownType, msg, false, false),
+				nil,
+				nil,
+			),
 		}},
 	}
 }
@@ -26,17 +24,15 @@ func View() slackClient.ModalViewRequest {
 	return slackClient.ModalViewRequest{
 		Type:            slackClient.VTModal,
 		PrivateMetadata: modals.CallbackDataToMetadata(modals.CallbackData{}, identifier),
-		Title:           &slackClient.TextBlockObject{Type: slackClient.PlainTextType, Text: "Refresh the Status"},
-		Close:           &slackClient.TextBlockObject{Type: slackClient.PlainTextType, Text: "Cancel"},
-		Submit:          &slackClient.TextBlockObject{Type: slackClient.PlainTextType, Text: "Submit"},
+		Title:           slackClient.NewTextBlockObject(slackClient.PlainTextType, "Refresh the Status", false, false),
+		Close:           slackClient.NewTextBlockObject(slackClient.PlainTextType, "Cancel", false, false),
+		Submit:          slackClient.NewTextBlockObject(slackClient.PlainTextType, "Submit", false, false),
 		Blocks: slackClient.Blocks{BlockSet: []slackClient.Block{
-			&slackClient.SectionBlock{
-				Type: slackClient.MBTSection,
-				Text: &slackClient.TextBlockObject{
-					Type: slackClient.MarkdownType,
-					Text: "If the cluster is currently marked as failed, retry fetching its credentials in case of an error",
-				},
-			},
+			slackClient.NewSectionBlock(
+				slackClient.NewTextBlockObject(slackClient.MarkdownType, "If the cluster is currently marked as failed, retry fetching its credentials in case of an error", false, false),
+				nil,
+				nil,
+			),
 		}},
 	}
 }
@@ -44,15 +40,13 @@ func View() slackClient.ModalViewRequest {
 func PrepareNextStepView() *slackClient.ModalViewRequest {
 	return &slackClient.ModalViewRequest{
 		Type:  slackClient.VTModal,
-		Title: &slackClient.TextBlockObject{Type: slackClient.PlainTextType, Text: "Refresh the Status"},
+		Title: slackClient.NewTextBlockObject(slackClient.PlainTextType, "Refresh the Status", false, false),
 		Blocks: slackClient.Blocks{BlockSet: []slackClient.Block{
-			&slackClient.SectionBlock{
-				Type: slackClient.MBTSection,
-				Text: &slackClient.TextBlockObject{
-					Type: slackClient.MarkdownType,
-					Text: "Processing the next step, do not close this window...",
-				},
-			},
+			slackClient.NewSectionBlock(
+				slackClient.NewTextBlockObject(slackClient.MarkdownType, "Processing the next step, do not close this window...", false, false),
+				nil,
+				nil,
+			),
 		}},
 	}
 }
