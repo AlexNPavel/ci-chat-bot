@@ -11,10 +11,13 @@ version=v${build_date}-${git_commit}
 SOURCE_GIT_TAG=v1.0.0+$(shell git rev-parse --short=7 HEAD)
 
 GO_LD_EXTRAFLAGS=-X github.com/openshift/ci-chat-bot/vendor/k8s.io/client-go/pkg/version.gitCommit=$(shell git rev-parse HEAD) -X github.com/openshift/ci-chat-bot/vendor/k8s.io/client-go/pkg/version.gitVersion=${SOURCE_GIT_TAG} -X sigs.k8s.io/prow/version.Name=ci-chat-bot -X sigs.k8s.io/prow/version.Version=${version}
+# Add gcs build tag for cyborg-data GCS support
+GO_BUILD_FLAGS=-tags gcs
+GO_TEST_FLAGS=-tags gcs
 GOLINT=golangci-lint run
 
 debug:
-	go build -gcflags="all=-N -l" ${GO_LD_FLAGS} -mod vendor -o ci-chat-bot ./cmd/...
+	go build -tags gcs -gcflags="all=-N -l" ${GO_LD_FLAGS} -mod vendor -o ci-chat-bot ./cmd/...
 .PHONY: debug
 
 vendor:

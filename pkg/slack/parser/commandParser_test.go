@@ -64,6 +64,16 @@ var supportedCommands = []BotCommand{
 		Example:     "workflow-launch openshift-e2e-gcp-windows-node 4.19 gcp",
 		Handler:     emptyHandler,
 	}, false),
+	NewBotCommand("request <resource?> <justification>", &CommandDefinition{
+		Description: "Request access to workspace.",
+		Example:     "request gcp-access \"Need to debug CI infrastructure issues\"",
+		Handler:     emptyHandler,
+	}, false),
+	NewBotCommand("revoke <resource?>", &CommandDefinition{
+		Description: "Revoke your workspace access before expiration.",
+		Example:     "revoke gcp-access",
+		Handler:     emptyHandler,
+	}, false),
 }
 
 func codeSlice(items []string) []string {
@@ -215,6 +225,23 @@ func TestMatch(t *testing.T) {
 				"name":                    "openshift-e2e-gcp",
 				"image_or_version_or_prs": "4.19",
 				"parameters":              "\"BASELINE_CAPABILITY_SET=None\",\"ADDITIONAL_ENABLED_CAPABILITIES=CloudControllerManager CloudCredential Console Ingress MachineAPI\"",
+			},
+		},
+	}, {
+		command: "request gcp-access \"Need to debug CI infrastructure issues\"",
+		match:   10,
+		properties: &Properties{
+			PropertyMap: map[string]string{
+				"resource":      "gcp-access",
+				"justification": "\"Need to debug CI infrastructure issues\"",
+			},
+		},
+	}, {
+		command: "revoke gcp-access",
+		match:   11,
+		properties: &Properties{
+			PropertyMap: map[string]string{
+				"resource": "gcp-access",
 			},
 		},
 	}}

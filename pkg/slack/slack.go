@@ -223,6 +223,16 @@ func (b *Bot) SupportedCommands() []parser.BotCommand {
 			Description: "List available versions for MCE clusters.",
 			Handler:     MceImageSets,
 		}, false),
+		parser.NewBotCommand("request <resource?> <justification>", &parser.CommandDefinition{
+			Description: "Request access to workspace. Access is granted for 7 days. Must be member of Hybrid Platforms organization.",
+			Example:     "request gcp-access \"Need to debug CI infrastructure issues\"",
+			Handler:     Request,
+		}, false),
+		parser.NewBotCommand("revoke <resource?>", &parser.CommandDefinition{
+			Description: "Revoke your workspace access before expiration.",
+			Example:     "revoke gcp-access",
+			Handler:     Revoke,
+		}, false),
 	}
 }
 
@@ -232,8 +242,8 @@ func GetUserName(client *slack.Client, userID string) string {
 		klog.Warningf("Failed to get the User Info for UserID: %s, %v", userID, err)
 		return ""
 	}
-	if strings.HasSuffix(user.Profile.Email, "@redhat.com") {
-		return strings.TrimSuffix(user.Profile.Email, "@redhat.com")
+	if before, ok := strings.CutSuffix(user.Profile.Email, "@redhat.com"); ok {
+		return before
 	}
 	klog.Warningf("Failed to get the User details for UserID: %s", userID)
 	return ""
@@ -316,15 +326,16 @@ func BuildJobParams(params string) (map[string]string, error) {
 			// We detected nested parameters so process them.
 			multiParams := strings.Join(split[1:], "=")
 			multiSplit := strings.Split(multiParams, ";")
-			value := multiSplit[0]
+			var value strings.Builder
+			value.WriteString(multiSplit[0])
 			for _, param := range multiSplit[1:] {
 				variable := strings.Split(param, "=")
 				if len(variable) != 2 {
 					return nil, fmt.Errorf("unable to interpret parameter in `%s`. Each nested parameter must be in the form of KEY=VALUE", param)
 				}
-				value += fmt.Sprintf("\n%s=%s", variable[0], variable[1])
+				value.WriteString(fmt.Sprintf("\n%s=%s", variable[0], variable[1]))
 			}
-			jobParams[split[0]] = value
+			jobParams[split[0]] = value.String()
 		} else if len(split) == 2 {
 			jobParams[split[0]] = parseParameterValue(split[1])
 		} else {

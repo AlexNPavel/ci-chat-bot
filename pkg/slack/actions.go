@@ -13,6 +13,7 @@ import (
 	"github.com/slack-go/slack"
 	"github.com/slack-go/slack/slackevents"
 	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/klog"
 )
 
 func LaunchCluster(client *slack.Client, jobManager manager.JobManager, event *slackevents.MessageEvent, properties *parser.Properties) string {
@@ -308,6 +309,102 @@ func Build(client *slack.Client, jobManager manager.JobManager, event *slackeven
 
 func Version(client *slack.Client, jobManager manager.JobManager, event *slackevents.MessageEvent, properties *parser.Properties) string {
 	return fmt.Sprintf("Running `%s` from https://github.com/openshift/ci-chat-bot", botversion.Get().String())
+}
+
+func Request(client *slack.Client, jobManager manager.JobManager, event *slackevents.MessageEvent, properties *parser.Properties) string {
+	// Extract command parameters
+	resource := properties.StringParam("resource", "")
+	justification := properties.StringParam("justification", "")
+
+	// Validate parameters
+	if resource == "" || justification == "" {
+		return "Invalid command format. Usage: request <resource> \"<business justification>\"\nExample: request gcp-access \"Need to debug CI infrastructure issues\""
+	}
+
+	klog.Infof("Resource: \"%s\"", resource)
+
+	// For now, only allow "gcp-access" resource
+	if resource != "gcp-access" {
+		return "Currently, access is only available for the 'gcp-access' resource."
+	}
+
+	// Get user's email
+	user, err := client.GetUserInfo(event.User)
+	if err != nil {
+		klog.Errorf("Failed to get user info for %s: %v", event.User, err)
+		return "Failed to retrieve your user information. Please try again or contact an administrator."
+	}
+
+	email := user.Profile.Email
+	if email == "" {
+		return "Could not determine your email address. Please ensure your Slack profile has an email configured."
+	}
+
+	// Validate using organizational data - check if user is in Hybrid Platforms
+	orgDataService := jobManager.GetOrgDataService()
+	if orgDataService == nil {
+		return "Organizational data service is not available. Please contact an administrator."
+	}
+
+	// Verify user is a member of Hybrid Platforms (required for all access)
+	if !isUserInOrg(orgDataService, event.User, email, "Hybrid Platforms") {
+		return "You are not a member of the 'Hybrid Platforms' organization. Access can only be granted to Hybrid Platforms members."
+	}
+
+	// Grant access with business justification
+	msg, err := jobManager.GrantGCPAccess(email, event.User, justification, resource)
+	if err != nil {
+		klog.Errorf("Failed to grant GCP access for %s: %v", email, err)
+		return fmt.Sprintf("Failed to grant access: %v", err)
+	}
+
+	return msg
+}
+
+func Revoke(client *slack.Client, jobManager manager.JobManager, event *slackevents.MessageEvent, properties *parser.Properties) string {
+	// Extract command parameters
+	resource := properties.StringParam("resource", "")
+
+	// Validate parameters
+	if resource == "" {
+		return "Invalid command format. Usage: revoke <resource>\nExample: revoke gcp-access"
+	}
+
+	// For now, only allow "gcp-access" resource
+	if resource != "gcp-access" {
+		return "Currently, access is only available for the 'gcp-access' resource."
+	}
+
+	// Get user's email
+	user, err := client.GetUserInfo(event.User)
+	if err != nil {
+		klog.Errorf("Failed to get user info for %s: %v", event.User, err)
+		return "Failed to retrieve your user information. Please try again or contact an administrator."
+	}
+
+	email := user.Profile.Email
+	if email == "" {
+		return "Could not determine your email address. Please ensure your Slack profile has an email configured."
+	}
+
+	// Validate using organizational data - check if user is in the openshift org
+	orgDataService := jobManager.GetOrgDataService()
+	if orgDataService == nil {
+		return "Organizational data service is not available. Please contact an administrator."
+	}
+
+	if !isUserInOrg(orgDataService, event.User, email, "Hybrid Platforms") {
+		return "GCP workspace access is only available to members of the Hybrid Platforms organization."
+	}
+
+	// Revoke access
+	msg, err := jobManager.RevokeGCPAccess(email, event.User)
+	if err != nil {
+		klog.Errorf("Failed to revoke GCP access for %s: %v", email, err)
+		return fmt.Sprintf("Failed to revoke access: %v", err)
+	}
+
+	return msg
 }
 
 func WorkflowLaunch(client *slack.Client, jobManager manager.JobManager, event *slackevents.MessageEvent, properties *parser.Properties) string {
@@ -606,4 +703,32 @@ func MceList(client *slack.Client, jobManager manager.JobManager, event *slackev
 	}
 	list, _, _ := jobManager.ListManagedClusters(event.User)
 	return list
+}
+
+// isUserInOrg checks if a user is in the specified organization.
+// It first tries to look up by Slack ID, and if that fails (e.g., in staging environments),
+// it falls back to looking up by email address and checking the employee's UID.
+func isUserInOrg(orgDataService manager.OrgDataService, slackID, email, org string) bool {
+	// First try Slack ID lookup (works in production)
+	if orgDataService.IsSlackUserInOrg(slackID, org) {
+		klog.V(2).Infof("User %s validated by Slack ID for org %s", slackID, org)
+		return true
+	}
+
+	// Fallback to email lookup (useful for staging/testing environments where Slack IDs differ)
+	klog.V(2).Infof("Slack ID %s not found in org data, trying email lookup for %s", slackID, email)
+	employee := orgDataService.GetEmployeeByEmail(email)
+	if employee == nil {
+		klog.V(2).Infof("User with email %s not found in organizational data", email)
+		return false
+	}
+
+	// Check if the employee (by UID) is in the specified organization
+	if orgDataService.IsEmployeeInOrg(employee.UID, org) {
+		klog.V(2).Infof("User %s validated by email (%s -> UID %s) for org %s", slackID, email, employee.UID, org)
+		return true
+	}
+
+	klog.V(2).Infof("User %s (email: %s, UID: %s) is not a member of org %s", slackID, email, employee.UID, org)
+	return false
 }

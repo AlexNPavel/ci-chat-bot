@@ -147,6 +147,8 @@ func NewJobManager(
 	dpcrHiveClient crclient.Client,
 	dpcrNamespaceClient typedcorev1.NamespaceInterface,
 	dpcrCoreClient *typedcorev1.CoreV1Client,
+	gcpAccessManager *GCPAccessManager,
+	orgDataService OrgDataService,
 ) *jobManager {
 	m := &jobManager{
 		requests:         make(map[string]*JobRequest),
@@ -184,6 +186,8 @@ func NewJobManager(
 		dpcrOcmClient:            dpcrOcmClient,
 		dpcrHiveClient:           dpcrHiveClient,
 		dpcrNamespaceClient:      dpcrNamespaceClient,
+		gcpAccessManager:         gcpAccessManager,
+		orgDataService:           orgDataService,
 	}
 	m.muJob.running = make(map[string]struct{})
 	initializeErrorMetrics(m.errorMetric)
@@ -322,6 +326,11 @@ func (m *jobManager) Start() error {
 			klog.Warningf("error during updateImageSetList: %v", err)
 		}
 	}, time.Minute*5)
+	go wait.Forever(func() {
+		if err := m.gcpAccessCleanup(); err != nil {
+			klog.Warningf("error during gcpAccessCleanup: %v", err)
+		}
+	}, time.Hour)
 	return nil
 }
 
@@ -2685,8 +2694,8 @@ func (m *jobManager) ListMceVersions() string {
 	imagesets := m.mceClusters.imagesets.UnsortedList()
 	imageSemVers := []semver.Version{}
 	for _, imageset := range imagesets {
-		if strings.HasSuffix(imageset, "-multi-appsub") {
-			verString := strings.TrimPrefix(strings.TrimSuffix(imageset, "-multi-appsub"), "img")
+		if before, ok := strings.CutSuffix(imageset, "-multi-appsub"); ok {
+			verString := strings.TrimPrefix(before, "img")
 			semver, err := semver.ParseTolerant(verString)
 			if err != nil {
 				continue
@@ -2770,4 +2779,99 @@ func (m *jobManager) schedule(pj *prowapiv1.ProwJob) (string, error) {
 		return "", fmt.Errorf("failed to schedule job %s: %v", pj.Name, err)
 	}
 	return cluster.Cluster, nil
+}
+
+// GrantGCPAccess grants GCP workspace access to a user
+func (m *jobManager) GrantGCPAccess(email, requestedBy, justification, resource string) (string, error) {
+	if m.gcpAccessManager == nil {
+		return "", fmt.Errorf("GCP access manager is not initialized")
+	}
+
+	// Check if user already has active access
+	grant, err := m.gcpAccessManager.GetUserGrant(email)
+	if err != nil {
+		return "", fmt.Errorf("failed to check existing access: %w", err)
+	}
+
+	if grant != nil && grant.ExpiresAt.After(time.Now()) {
+		// User already has active access - inform them when they expire
+		daysRemaining := int(time.Until(grant.ExpiresAt).Hours() / 24)
+		hoursRemaining := int(time.Until(grant.ExpiresAt).Hours())
+		timeRemaining := ""
+		if daysRemaining > 0 {
+			timeRemaining = fmt.Sprintf("in %d days", daysRemaining)
+		} else {
+			timeRemaining = fmt.Sprintf("in %d hours", hoursRemaining)
+		}
+		return fmt.Sprintf("You already have active access for project %q.\n\n"+
+			"Your access will expire on %s (%s).\n\n"+
+			"Original justification: %s",
+			GCPProjectID,
+			grant.ExpiresAt.Format("2006-01-02 15:04 MST"),
+			timeRemaining,
+			grant.Justification), nil
+	}
+
+	// Grant new access
+	if err := m.gcpAccessManager.GrantAccess(email, requestedBy, justification, resource); err != nil {
+		return "", fmt.Errorf("failed to grant access: %w", err)
+	}
+
+	// Get the grant details
+	grant, err = m.gcpAccessManager.GetUserGrant(email)
+	if err != nil {
+		return "", fmt.Errorf("failed to retrieve access details: %w", err)
+	}
+
+	return fmt.Sprintf("Confirmed you are a member of the Hybrid Platforms organization. You have been added to project %q.\n\n"+
+		"You will have access to the project for the next 7 days (until %s).\n\n"+
+		"You are responsible for deleting resources you create within this account, however, resources older than 48 hours will be deleted automatically.\n\n"+
+		"Use `gcloud auth application-default login` to make your credentials available for OpenShift installations & other programs requiring access to Google Cloud.\n\n"+
+		"Justification: %s",
+		GCPProjectID,
+		grant.ExpiresAt.Format("2006-01-02 15:04 MST"),
+		justification), nil
+}
+
+// RevokeGCPAccess revokes GCP workspace access for a user
+func (m *jobManager) RevokeGCPAccess(email, requestedBy string) (string, error) {
+	if m.gcpAccessManager == nil {
+		return "", fmt.Errorf("GCP access manager is not initialized")
+	}
+
+	// Check if user has active access
+	grant, err := m.gcpAccessManager.GetUserGrant(email)
+	if err != nil {
+		return "", fmt.Errorf("failed to check existing access: %w", err)
+	}
+
+	if grant == nil || grant.ExpiresAt.Before(time.Now()) {
+		return "You do not have any active GCP workspace access to revoke.", nil
+	}
+
+	// Revoke access
+	if err := m.gcpAccessManager.RevokeAccess(email); err != nil {
+		return "", fmt.Errorf("failed to revoke access: %w", err)
+	}
+
+	return "Your GCP workspace access has been revoked successfully.", nil
+}
+
+// GetGCPAccessManager returns the GCP access manager
+func (m *jobManager) GetGCPAccessManager() *GCPAccessManager {
+	return m.gcpAccessManager
+}
+
+func (m *jobManager) GetOrgDataService() OrgDataService {
+	return m.orgDataService
+}
+
+// gcpAccessCleanup removes expired GCP access grants
+func (m *jobManager) gcpAccessCleanup() error {
+	if m.gcpAccessManager == nil || !m.gcpAccessManager.IsEnabled() {
+		return nil
+	}
+
+	klog.V(2).Info("Running GCP access cleanup")
+	return m.gcpAccessManager.CleanupExpiredAccess()
 }
