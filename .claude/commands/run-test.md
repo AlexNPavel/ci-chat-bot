@@ -11,8 +11,11 @@ You are helping the user run a test instance of the ci-chat-bot. Follow these st
 - Do NOT share the chat transcript or logs containing these credentials with others
 - Credentials will be visible in process listings (`ps aux`) while the bot is running
 - The ngrok tunnel exposes your local bot instance to the internet - only use test/development Slack apps
-- Logs at `/tmp/ci-chat-bot.log` may contain sensitive information
+- Logs at `/tmp/ci-chat-bot/bot.log` may contain sensitive information
 - For production deployments, use proper secret management (Kubernetes secrets, vault, etc.) instead of environment variables
+- **Process management**: this workflow tracks the bot and ngrok processes via PID files (`/tmp/ci-chat-bot/bot.pid`, `/tmp/ci-chat-bot/ngrok.pid`) so they can be stopped precisely. **Never** use broad-match kill commands (`pkill -f <generic substring>`, `killall`, `pkill node`, `pkill go`, `pkill ngrok`, etc.) in this workflow — a broad pattern can match unrelated processes, including the Claude Code CLI's own process tree, and kill it.
+
+0. **Prepare the working directory**: Run `mkdir -p /tmp/ci-chat-bot` before starting anything. All logs and PID files for this workflow live under this one directory rather than scattered directly in `/tmp`.
 
 1. **Check Environment Variables**: First ask the user if they want to load environment variables from a file.
 
@@ -63,7 +66,11 @@ You are helping the user run a test instance of the ci-chat-bot. Follow these st
    - If this fails, the user needs to authenticate to the OpenShift CI cluster first
 
 3. **Setup ngrok Tunnel**: Start ngrok to expose the bot to Slack:
-   - Run `ngrok http 8080` in the background
+   - Run ngrok in the background, capturing its output and PID so it can be managed later:
+     ```bash
+     ngrok http 8080 > /tmp/ci-chat-bot/ngrok.log 2>&1 &
+     echo $! > /tmp/ci-chat-bot/ngrok.pid
+     ```
    - Extract and display the public HTTPS URL that ngrok provides
    - The URL will look like: `https://xxxx-xx-xx-xx-xx.ngrok-free.app`
    - Inform the user they need to configure this URL in their Slack app settings:
@@ -79,7 +86,8 @@ You are helping the user run a test instance of the ci-chat-bot. Follow these st
 
    **If using an environment file (Option A from step 1):**
    ```bash
-   set -a && source /path/to/.env && set +a && make run > /tmp/ci-chat-bot.log 2>&1 &
+   set -a && source /path/to/.env && set +a && make run > /tmp/ci-chat-bot/bot.log 2>&1 &
+   echo $! > /tmp/ci-chat-bot/bot.pid
    ```
    Replace `/path/to/.env` with the actual file path provided by the user.
 
@@ -87,12 +95,14 @@ You are helping the user run a test instance of the ci-chat-bot. Follow these st
 
    Normal mode (with IAM changes):
    ```bash
-   BOT_TOKEN=<token-from-step-1> BOT_SIGNING_SECRET=<secret-from-step-1> make run > /tmp/ci-chat-bot.log 2>&1 &
+   BOT_TOKEN=<token-from-step-1> BOT_SIGNING_SECRET=<secret-from-step-1> make run > /tmp/ci-chat-bot/bot.log 2>&1 &
+   echo $! > /tmp/ci-chat-bot/bot.pid
    ```
 
    Dry-run mode (recommended for testing credentials command):
    ```bash
-   GCP_ACCESS_DRY_RUN=true BOT_TOKEN=<token-from-step-1> BOT_SIGNING_SECRET=<secret-from-step-1> make run > /tmp/ci-chat-bot.log 2>&1 &
+   GCP_ACCESS_DRY_RUN=true BOT_TOKEN=<token-from-step-1> BOT_SIGNING_SECRET=<secret-from-step-1> make run > /tmp/ci-chat-bot/bot.log 2>&1 &
+   echo $! > /tmp/ci-chat-bot/bot.pid
    ```
 
    Use the actual values provided by the user in step 1.
@@ -104,23 +114,78 @@ You are helping the user run a test instance of the ci-chat-bot. Follow these st
    - Extract MCE kubeconfig and token
    - Build the binary if needed
    - Start the bot with all required configuration
-   - Redirect all output to `/tmp/ci-chat-bot.log` for easy monitoring
+   - Redirect all output to `/tmp/ci-chat-bot/bot.log` for easy monitoring
+   - Record the backgrounded bot's PID to `/tmp/ci-chat-bot/bot.pid`
+
+   Note: `make run` may itself spawn the actual bot binary as a child process, so `$!` (the PID of the `make run` shell) is a reasonable handle for stopping the tree, but always verify with `ps -p "$PID" -o cmd=` before killing (see "Relaunching the Bot" below).
 
 6. **Verify the Bot is Running**:
    - Check that the bot starts without errors
    - By default it listens on port 8080
    - Verify ngrok is still running and forwarding requests
-   - Monitor logs with: `tail -f /tmp/ci-chat-bot.log`
+   - Monitor logs with: `tail -f /tmp/ci-chat-bot/bot.log`
    - Test basic Slack connectivity by sending a message to the bot in Slack
 
 7. **Inform User About Log Monitoring**: After starting the bot, inform the user:
-   - Logs are saved to `/tmp/ci-chat-bot.log`
-   - They can monitor logs in real-time with: `tail -f /tmp/ci-chat-bot.log`
-   - To filter for errors: `tail -f /tmp/ci-chat-bot.log | grep -i error`
-   - To filter for warnings: `tail -f /tmp/ci-chat-bot.log | grep -i warning`
+   - Logs are saved to `/tmp/ci-chat-bot/bot.log`
+   - They can monitor logs in real-time with: `tail -f /tmp/ci-chat-bot/bot.log`
+   - To filter for errors: `tail -f /tmp/ci-chat-bot/bot.log | grep -i error`
+   - To filter for warnings: `tail -f /tmp/ci-chat-bot/bot.log | grep -i warning`
+
+## Relaunching the Bot
+
+"Relaunching" means restarting **only** the ci-chat-bot process. **Leave ngrok running** — its tunnel URL doesn't need to change across a relaunch, and the Slack app's configured Request URLs point at that tunnel, so tearing it down would break the Slack app config for no reason. The `/tmp/ci-chat-bot/ngrok.pid` file exists solely so ngrok can be shut down cleanly later, when the user explicitly says to stop testing — not as part of a relaunch.
+
+1. **Stop the bot narrowly**, verifying the PID actually belongs to the bot before killing it:
+   ```bash
+   if [ -f /tmp/ci-chat-bot/bot.pid ]; then
+     PID=$(cat /tmp/ci-chat-bot/bot.pid)
+     if ps -p "$PID" -o cmd= | grep -q "ci-chat-bot\|make run"; then
+       kill "$PID"
+     else
+       echo "PID $PID does not look like the ci-chat-bot process; not killing. Inspect manually."
+     fi
+   fi
+   ```
+   If `/tmp/ci-chat-bot/bot.pid` is missing or stale (e.g. the bot was started outside this command), do **not** guess with a broad pattern kill. Instead identify it narrowly and confirm with the user first:
+   ```bash
+   pgrep -fa ci-chat-bot
+   pgrep -fa "make run"
+   ```
+   Show the full command line(s) to the user. Only proceed to kill if there is exactly one unambiguous match and the user confirms it. If there are multiple matches, stop and ask — never kill on an ambiguous/multi-match result.
+
+2. **Rebuild if needed**: Run `make` to pick up code changes.
+
+3. **Start the bot again** per step 5 above (do **not** touch ngrok), re-recording the new PID to `/tmp/ci-chat-bot/bot.pid`.
+
+4. **Verify**: tail `/tmp/ci-chat-bot/bot.log` to confirm a clean startup, and confirm ngrok is still forwarding (it was never touched).
+
+## Stopping the Test
+
+When the user says to stop testing entirely, stop **both** processes, each verified narrowly before killing (never a broad pattern match):
+
+```bash
+if [ -f /tmp/ci-chat-bot/bot.pid ]; then
+  PID=$(cat /tmp/ci-chat-bot/bot.pid)
+  if ps -p "$PID" -o cmd= | grep -q "ci-chat-bot\|make run"; then
+    kill "$PID"
+  else
+    echo "PID $PID does not look like the ci-chat-bot process; not killing. Inspect manually."
+  fi
+fi
+
+if [ -f /tmp/ci-chat-bot/ngrok.pid ]; then
+  PID=$(cat /tmp/ci-chat-bot/ngrok.pid)
+  if ps -p "$PID" -o cmd= | grep -q "ngrok"; then
+    kill "$PID"
+  else
+    echo "PID $PID does not look like the ngrok process; not killing. Inspect manually."
+  fi
+fi
+```
 
 8. **Provide Troubleshooting Tips** if issues arise:
-   - Check logs: `tail -100 /tmp/ci-chat-bot.log` to see recent output
+   - Check logs: `tail -100 /tmp/ci-chat-bot/bot.log` to see recent output
    - If ngrok fails to start, verify it's installed (`ngrok version`)
    - If secrets extraction fails, verify cluster access with `oc --context app.ci whoami`
    - If the bot fails to start, check the error messages in the log file
@@ -136,6 +201,7 @@ You are helping the user run a test instance of the ci-chat-bot. Follow these st
      - Verify BigQuery audit logs are still being created
      - Confirm IAM policy remains unchanged in GCP Console
      - If testing credentials command, use: `credentials openshift gcp "test message"`
+   - **Process management**: the bot and ngrok are tracked via `/tmp/ci-chat-bot/bot.pid` and `/tmp/ci-chat-bot/ngrok.pid`. Always verify a PID's command line with `ps -p "$PID" -o cmd=` before killing it. Never use broad-match kill commands (`pkill -f <generic substring>`, `killall`, `pkill node`/`pkill go`/`pkill ngrok`) — they can match unrelated processes, including the Claude Code CLI's own process.
 
 ## Creating an Environment File Template
 
@@ -170,7 +236,7 @@ Tell the user to:
 When running in dry-run mode (`GCP_ACCESS_DRY_RUN=true`), you can safely test the credentials command:
 
 1. In Slack, send: `credentials openshift gcp "Testing dry-run mode"`
-2. Check logs for: `grep "DRY-RUN" /tmp/ci-chat-bot.log`
+2. Check logs for: `grep "DRY-RUN" /tmp/ci-chat-bot/bot.log`
 3. You should see messages like:
    - `GCP credentials manager running in DRY-RUN mode`
    - `DRY-RUN: Would grant GCP IAM credentials to user...`

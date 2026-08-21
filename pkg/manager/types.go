@@ -469,6 +469,7 @@ type Job struct {
 	Inputs []JobInput
 
 	Credentials        string
+	Credentials2       string
 	CredentialsSnippet string
 	Failure            string
 

@@ -447,6 +447,10 @@ func (m *jobManager) newJob(job *Job) (string, error) {
 	} else {
 		prow.OverrideJobEnvironment(&pj.Spec, runImage, initialImage, targetRelease, namespace, variants)
 	}
+	// ARO-HCP prow jobs may not define BRANCH; the PR child-build path needs it for the INITIAL release import.
+	if job.Mode == JobTypeAroHcp {
+		prow.SetJobEnvVar(&pj.Spec, "BRANCH", targetRelease)
+	}
 
 	if job.Architecture == "arm64" {
 		for i := range pj.Spec.PodSpec.Containers {
@@ -661,8 +665,6 @@ func (m *jobManager) newJob(job *Job) (string, error) {
 		}
 	}
 	if hasRefs {
-		launchDeadline += 30 * time.Minute
-
 		// in order to build repos, we need to clone all the refs
 		boolFalse := false
 		pj.Spec.DecorationConfig.SkipCloning = &boolFalse
@@ -676,7 +678,7 @@ func (m *jobManager) newJob(job *Job) (string, error) {
 		if err != nil {
 			return "", fmt.Errorf("unable to lookup registry URL for job")
 		}
-		registryHost := strings.SplitN(is.Status.PublicDockerImageRepository, "/", 2)[0]
+		registryHost, _, _ := strings.Cut(is.Status.PublicDockerImageRepository, "/")
 
 		// NAMESPACE must be set for this job, and be in the first position, so remove it if set
 		prow.RemoveJobEnvVar(&pj.Spec, "NAMESPACE")
@@ -1254,7 +1256,7 @@ func (m *jobManager) waitForJob(job *Job) error {
 		setupContainerTimeout += 30 * time.Minute
 	}
 
-	if job.Mode != JobTypeLaunch && job.Mode != JobTypeWorkflowLaunch {
+	if !isClusterLaunchMode(job.Mode) {
 		klog.Infof("Job %s will report results at %s (to %s / %s)", job.Name, job.URL, job.RequestedBy, job.RequestedChannel)
 
 		// loop waiting for job to complete
@@ -1399,6 +1401,11 @@ func (m *jobManager) waitForJob(job *Job) error {
 				return true, nil
 			}
 		}
+		if job.Mode == JobTypeAroHcp {
+			if _, ok := secretDir.Data["kubeconfig.svc"]; ok { // if one kubeconfig exists, both will as they are generated in the same step
+				return true, nil
+			}
+		}
 		return false, nil
 	})
 	if err != nil {
@@ -1406,6 +1413,34 @@ func (m *jobManager) waitForJob(job *Job) error {
 			return err
 		}
 		return fmt.Errorf("cluster never became available: %v", err)
+	}
+
+	if job.Mode == JobTypeAroHcp {
+		clusterClient, err := getClusterClient(m, job)
+		if err != nil {
+			return err
+		}
+		secretDir, err := clusterClient.CoreClient.CoreV1().Secrets(namespace).Get(context.TODO(), targetName, metav1.GetOptions{})
+		if err != nil {
+			klog.Errorf("job %q unable to access step secret in %s/%s", job.Name, namespace, targetName)
+			return fmt.Errorf("could not retrieve kubeconfig.svc and kubeconfig.mgmt from secret %s/%s: %v", namespace, targetName, err)
+		}
+		svc, ok := secretDir.Data["kubeconfig.svc"]
+		if !ok {
+			klog.Errorf("job %q unable to find kubeconfig.svc entry in step secret in %s/%s", job.Name, namespace, targetName)
+			return fmt.Errorf("could not retrieve kubeconfig.svc from pod %s/%s", namespace, targetName)
+		}
+		mgmt, ok := secretDir.Data["kubeconfig.mgmt"]
+		if !ok {
+			klog.Errorf("job %q unable to find kubeconfig.mgmt entry in step secret in %s/%s", job.Name, namespace, targetName)
+			return fmt.Errorf("could not retrieve kubeconfig.mgmt from pod %s/%s", namespace, targetName)
+		}
+		job.Credentials = string(svc)
+		job.Credentials2 = string(mgmt)
+		created := len(pj.Annotations["ci-chat-bot.openshift.io/expires"]) == 0
+		startDuration := time.Since(started)
+		m.clearNotificationAnnotations(job, created, startDuration)
+		return nil
 	}
 
 	var kubeconfig string

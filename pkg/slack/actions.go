@@ -711,6 +711,63 @@ func MceList(client parser.SlackClient, jobManager manager.JobManager, event *sl
 	return list
 }
 
+func AroHcpCreate(client parser.SlackClient, jobManager manager.JobManager, event *slackevents.MessageEvent, properties *parser.Properties) string {
+	userName := GetUserName(client, event.User)
+	from, err := ParseImageInput(properties.StringParam("image_or_version_or_prs", ""))
+	if err != nil {
+		return err.Error()
+	}
+	var inputs [][]string
+	if len(from) > 0 {
+		inputs = [][]string{from}
+	}
+
+	msg, err := jobManager.LaunchJobForUser(&manager.JobRequest{
+		OriginalMessage: event.Text,
+		User:            event.User,
+		UserName:        userName,
+		Inputs:          inputs,
+		Type:            manager.JobTypeAroHcp,
+		Channel:         event.Channel,
+		Architecture:    "amd64",
+	})
+	if err != nil {
+		return err.Error()
+	}
+	return msg
+}
+
+func AroHcpAuth(client parser.SlackClient, jobManager manager.JobManager, event *slackevents.MessageEvent, properties *parser.Properties) string {
+	job, err := jobManager.GetLaunchJob(event.User)
+	if err != nil {
+		return err.Error()
+	}
+	if job.Mode != manager.JobTypeAroHcp {
+		return "You don't have a running ARO-HCP managed service environment."
+	}
+	if len(job.Credentials) == 0 {
+		return "Your ARO-HCP managed service environment credentials are not ready yet."
+	}
+	job.RequestedChannel = event.Channel
+	NotifyAroHcp(client, job, true)
+	return ""
+}
+
+func AroHcpDelete(client parser.SlackClient, jobManager manager.JobManager, event *slackevents.MessageEvent, properties *parser.Properties) string {
+	job, err := jobManager.GetLaunchJob(event.User)
+	if err != nil {
+		return err.Error()
+	}
+	if job.Mode != manager.JobTypeAroHcp {
+		return "You don't have a running ARO-HCP managed service environment."
+	}
+	msg, err := jobManager.TerminateJobForUser(event.User)
+	if err != nil {
+		return err.Error()
+	}
+	return msg
+}
+
 // isUserInOrg checks if a user is in the specified organization.
 // It first tries to look up by Slack ID, and if that fails (e.g., in staging environments),
 // it falls back to looking up by email address and checking the employee's UID.
