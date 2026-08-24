@@ -1,6 +1,9 @@
 package manager
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func Test_containsValidVersion(t *testing.T) {
 	type args struct {
@@ -283,6 +286,52 @@ func Test_containsValidVersion(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := containsValidVersion(tt.args.listOfImageOrVersionOrPRs); got != tt.want {
 				t.Errorf("containsValidVersion() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestResolveToJobRejectsBuildWithBundle(t *testing.T) {
+	t.Parallel()
+
+	m := &jobManager{clusterPrefix: "bot-"}
+	tests := []struct {
+		name            string
+		bundle          string
+		wantBundleInErr bool
+	}{
+		{
+			name:            "non-empty bundle",
+			bundle:          "my-operator-bundle",
+			wantBundleInErr: true,
+		},
+		{
+			name:            "empty bundle",
+			bundle:          "",
+			wantBundleInErr: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			job, err := m.resolveToJob(&JobRequest{
+				User:      "user",
+				Type:      JobTypeBuild,
+				JobParams: map[string]string{"bundle": tt.bundle},
+				Inputs:    [][]string{{"openshift/installer#1"}},
+			})
+			if job != nil {
+				t.Fatalf("expected nil job, got: %#v", job)
+			}
+			if err == nil {
+				t.Fatal("expected error for build job with bundle parameter")
+			}
+			if !strings.Contains(err.Error(), "catalog build") {
+				t.Fatalf("expected catalog build guidance, got: %v", err)
+			}
+			if tt.wantBundleInErr && !strings.Contains(err.Error(), tt.bundle) {
+				t.Fatalf("expected bundle name in error, got: %v", err)
 			}
 		})
 	}
