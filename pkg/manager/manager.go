@@ -1744,6 +1744,14 @@ func (m *jobManager) resolveToJob(req *JobRequest) (*Job, error) {
 	if len(req.Type) == 0 {
 		req.Type = JobTypeBuild
 	}
+	if req.Type == JobTypeBuild {
+		if bundleName, ok := req.JobParams["bundle"]; ok {
+			if bundleName == "" {
+				return nil, fmt.Errorf("the `bundle` parameter is not supported with `build`; use `catalog build` to build an operator catalog")
+			}
+			return nil, fmt.Errorf("the `bundle` parameter %q is not supported with `build`; use `catalog build` to build an operator catalog", bundleName)
+		}
+	}
 
 	req.RequestedAt = time.Now()
 	name := fmt.Sprintf("%s%s", m.clusterPrefix, req.RequestedAt.UTC().Format("2006-01-02-150405.9999"))
@@ -2357,6 +2365,9 @@ func (m *jobManager) LaunchJobForUser(req *JobRequest) (string, error) {
 		msg = fmt.Sprintf("%s However, if you are testing specific functionality relating to the control plane in the release version you provided or you require", msg)
 		msg = fmt.Sprintf("%s multiple worker nodes, please end abort this launch with `done` and launch a cluster using another platform such as `aws` or `gcp`", msg)
 		msg = fmt.Sprintf("%s (e.g. `launch 4.19 aws`).\n\n", msg)
+	}
+	if job.Operator.Is && job.Mode == JobTypeBuild {
+		msg = fmt.Sprintf("%s\n\nNote: the `build` command creates release images; if you want to build an operator catalog to test the defined optional operators instead, use `catalog build`.\n\n", msg)
 	}
 
 	if job.Mode == JobTypeLaunch || job.Mode == JobTypeWorkflowLaunch {
