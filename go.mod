@@ -40,7 +40,7 @@ require (
 	github.com/blang/semver v3.5.1+incompatible
 	github.com/onsi/ginkgo/v2 v2.27.1
 	github.com/onsi/gomega v1.38.2
-	github.com/openshift-eng/cyborg-data/go v0.0.0-20260504195424-a073366e1c6a
+	github.com/openshift-eng/cyborg-data/go v0.0.0-20260901124137-30bc39816344
 	github.com/openshift-online/ocm-sdk-go v0.1.459
 	github.com/openshift/api v0.0.0-20251120220512-cb382c9eaf42
 	github.com/openshift/build-machinery-go v0.0.0-20250530140348-dc5b2804eeee
