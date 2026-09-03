@@ -1293,6 +1293,8 @@ func (m *jobManager) ResolveImageOrVersion(imageOrVersion, defaultImageOrVersion
 		imagestreams = append(imagestreams, namespaceAndStream{Namespace: "origin", Imagestream: "release"})
 		imagestreams = append(imagestreams, namespaceAndStream{Namespace: "origin", Imagestream: "release-scos"})
 		imagestreams = append(imagestreams, namespaceAndStream{Namespace: "origin", Imagestream: "release-scos-next"})
+		imagestreams = append(imagestreams, namespaceAndStream{Namespace: "origin", Imagestream: "release-5-scos"})
+		imagestreams = append(imagestreams, namespaceAndStream{Namespace: "origin", Imagestream: "release-5-scos-next"})
 	case "arm64":
 		imagestreams = append(imagestreams, namespaceAndStream{Namespace: "ocp-arm64", Imagestream: "release-arm64", ArchSuffix: "-arm64"})
 		imagestreams = append(imagestreams, namespaceAndStream{Namespace: "ocp-arm64", Imagestream: "release-5-arm64", ArchSuffix: "-arm64"})
@@ -2095,7 +2097,7 @@ var validVersionRegexes = []*regexp.Regexp{
 	// OKD versions
 	// quay.io/okd/scos-release:4.19.0-okd-scos.ec.8
 	regexp.MustCompile(`^quay\.io/okd/scos-release:\d+\.\d+\.\d+-okd-scos\.ec\.\d+$`),
-	regexp.MustCompile(`^(quay\.io/okd|quay\.io/openshift/okd|registry\.ci\.openshift\.org/origin/release-scos):\d+\.\d+\.\d+-0\.okd(-scos)?(\.ec\.\d+)?(-\d{4}-\d{2}-\d{2}-\d{6})?$`),
+	regexp.MustCompile(`^(quay\.io/okd|quay\.io/openshift/okd|registry\.ci\.openshift\.org/origin/release(-5)?-scos(-next)?):\d+\.\d+\.\d+-0\.okd(-scos)?(\.ec\.\d+)?(-\d{4}-\d{2}-\d{2}-\d{6})?$`),
 
 	// Private releases
 	regexp.MustCompile(`^registry\.ci\.openshift\.org/ocp-priv/release-priv:\d+\.\d+\.\d+-0\.nightly-priv-\d{4}-\d{2}-\d{2}-\d{6}`),
