@@ -33,13 +33,13 @@ You are helping the user run a test instance of the ci-chat-bot. Follow these st
    BOT_SIGNING_SECRET=your-signing-secret
    GITHUB_TOKEN=ghp_your-github-token
    GCP_ACCESS_DRY_RUN=true
-   GCP_SERVICE_ACCOUNT_JSON={"type":"service_account",...}
+   GCP_SERVICE_ACCOUNT_JSON='{"type":"service_account",...}'
    ORG_DATA_BUCKET=your-org-data-bucket
    ```
 
    If the user provides a file path:
    - Verify the file exists
-   - Load the environment variables using `source` or `export $(cat file | xargs)`
+   - Load the environment variables with `set -a; source "/path/to/file"; set +a` so quoted or whitespace-containing values are preserved
    - Store the file path to use in step 5
 
    **Option B: Manual Entry (if no env file)**
@@ -94,15 +94,15 @@ You are helping the user run a test instance of the ci-chat-bot. Follow these st
 
    Normal mode (with IAM changes):
    ```bash
-   BOT_TOKEN=<token-from-step-1> BOT_SIGNING_SECRET=<secret-from-step-1> make run > /tmp/ci-chat-bot.log 2>&1 &
+   BOT_TOKEN='<token-from-step-1>' BOT_SIGNING_SECRET='<secret-from-step-1>' GITHUB_TOKEN='<github-token-from-step-1>' GCP_SERVICE_ACCOUNT_JSON='<service-account-json-from-step-1>' ORG_DATA_BUCKET='<bucket-from-step-1>' make run > /tmp/ci-chat-bot.log 2>&1 &
    ```
 
    Dry-run mode (recommended for testing credentials command):
    ```bash
-   GCP_ACCESS_DRY_RUN=true BOT_TOKEN=<token-from-step-1> BOT_SIGNING_SECRET=<secret-from-step-1> make run > /tmp/ci-chat-bot.log 2>&1 &
+   GCP_ACCESS_DRY_RUN=true BOT_TOKEN='<token-from-step-1>' BOT_SIGNING_SECRET='<secret-from-step-1>' GITHUB_TOKEN='<github-token-from-step-1>' GCP_SERVICE_ACCOUNT_JSON='<service-account-json-from-step-1>' ORG_DATA_BUCKET='<bucket-from-step-1>' make run > /tmp/ci-chat-bot.log 2>&1 &
    ```
 
-   Use the actual values provided by the user in step 1.
+   Use the actual values provided by the user in step 1. Omit an optional variable assignment when the user did not supply that value. Keep every value shell-quoted, especially the service account JSON.
 
    This will:
    - Extract kubeconfig files from the `ci-chat-bot-kubeconfigs` secret
@@ -159,7 +159,7 @@ GITHUB_TOKEN=ghp_your-github-token-here
 
 # Optional: GCP Credentials feature
 GCP_ACCESS_DRY_RUN=true
-GCP_SERVICE_ACCOUNT_JSON={"type":"service_account","project_id":"your-project",...}
+GCP_SERVICE_ACCOUNT_JSON='{"type":"service_account","project_id":"your-project",...}'
 ORG_DATA_BUCKET=your-org-data-bucket
 
 # Add any other environment variables your bot needs
