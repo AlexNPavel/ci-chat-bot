@@ -830,7 +830,9 @@ func AroHcpAuth(client parser.SlackClient, jobManager manager.JobManager, event 
 		return "Your ARO-HCP managed service environment credentials are not ready yet."
 	}
 	job.RequestedChannel = event.Channel
-	NotifyAroHcp(client, job, true)
+	if _, _, err := NotifyAroHcp(client, job, true); err != nil {
+		return err.Error()
+	}
 	return ""
 }
 

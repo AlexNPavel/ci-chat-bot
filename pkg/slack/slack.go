@@ -48,7 +48,9 @@ func (b *Bot) JobResponder(s *slack.Client) func(manager.Job) {
 				klog.Infof("no credentials or failure, still pending")
 				return
 			}
-			NotifyAroHcp(s, &job, true)
+			if _, _, err := NotifyAroHcp(s, &job, true); err != nil {
+				klog.Errorf("Failed to notify ARO-HCP job %s: %v", job.Name, err)
+			}
 			return
 		default:
 			if len(job.URL) == 0 && len(job.Failure) == 0 {
@@ -379,7 +381,12 @@ func NotifyJob(client parser.SlackClient, job *manager.Job, postMessage bool) (s
 	var msg, kubeconfig string
 	switch job.Mode {
 	case manager.JobTypeAroHcp:
-		return NotifyAroHcp(client, job, postMessage)
+		msg, kubeconfig, err := NotifyAroHcp(client, job, postMessage)
+		if err != nil {
+			klog.Errorf("Failed to notify ARO-HCP job %s: %v", job.Name, err)
+			return err.Error(), ""
+		}
+		return msg, kubeconfig
 	case manager.JobTypeLaunch, manager.JobTypeWorkflowLaunch:
 		switch {
 		case len(job.Failure) > 0 && len(job.URL) > 0:
@@ -553,7 +560,7 @@ func SendKubeConfig(client parser.SlackClient, channel, contents, comment, ident
 	return summary.ID
 }
 
-func NotifyAroHcp(client parser.SlackClient, job *manager.Job, postMessage bool) (string, string) {
+func NotifyAroHcp(client parser.SlackClient, job *manager.Job, postMessage bool) (string, string, error) {
 	var msg string
 	switch {
 	case len(job.Failure) > 0 && len(job.URL) > 0:
@@ -594,17 +601,19 @@ func NotifyAroHcp(client parser.SlackClient, job *manager.Job, postMessage bool)
 			time.Until(job.ExpiresAt)/time.Minute,
 		)
 		if postMessage {
+			if _, _, err := SendAroHcpKubeconfigs(client, job.RequestedChannel, job.Credentials, job.Credentials2, job.RequestedAt.Format("2006-01-02-150405")); err != nil {
+				return "", "", err
+			}
 			_, _, err := client.PostMessage(job.RequestedChannel, slack.MsgOptionText(msg, false))
 			if err != nil {
-				klog.Warningf("Failed to post the msg: %s\nto the channel: %s.", msg, job.RequestedChannel)
+				return "", "", fmt.Errorf("unable to post ARO-HCP ready message: %w", err)
 			}
-			SendAroHcpKubeconfigs(client, job.RequestedChannel, job.Credentials, job.Credentials2, job.RequestedAt.Format("2006-01-02-150405"))
 		}
 	}
-	return msg, job.Credentials
+	return msg, job.Credentials, nil
 }
 
-func SendAroHcpKubeconfigs(client parser.SlackClient, channel, svc, mgmt, identifier string) (string, string) {
+func SendAroHcpKubeconfigs(client parser.SlackClient, channel, svc, mgmt, identifier string) (string, string, error) {
 	params := slack.UploadFileParameters{
 		Content:  mgmt,
 		FileSize: len(mgmt),
@@ -613,8 +622,7 @@ func SendAroHcpKubeconfigs(client parser.SlackClient, channel, svc, mgmt, identi
 	}
 	summary, err := client.UploadFile(params)
 	if err != nil {
-		klog.Errorf("error: unable to send attachment with message: %v", err)
-		return "", ""
+		return "", "", fmt.Errorf("unable to upload ARO-HCP management kubeconfig: %w", err)
 	}
 	params2 := slack.UploadFileParameters{
 		Content:  svc,
@@ -624,11 +632,10 @@ func SendAroHcpKubeconfigs(client parser.SlackClient, channel, svc, mgmt, identi
 	}
 	summary2, err := client.UploadFile(params2)
 	if err != nil {
-		klog.Errorf("error: unable to send attachment with message: %v", err)
-		return "", ""
+		return summary.ID, "", fmt.Errorf("unable to upload ARO-HCP service kubeconfig: %w", err)
 	}
 	klog.Infof("successfully uploaded ARO-HCP credentials to %s", channel)
-	return summary.ID, summary2.ID
+	return summary.ID, summary2.ID, nil
 }
 
 func SendGCPServiceAccountKey(client parser.SlackClient, channel, keyJSON, email string) error {
