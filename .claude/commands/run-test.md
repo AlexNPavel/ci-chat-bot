@@ -15,7 +15,16 @@ You are helping the user run a test instance of the ci-chat-bot. Follow these st
 - For production deployments, use proper secret management (Kubernetes secrets, vault, etc.) instead of environment variables
 - **Process management**: this workflow tracks the bot session and ngrok process via PID files (`/tmp/ci-chat-bot/bot.pid`, `/tmp/ci-chat-bot/ngrok.pid`). The bot runs in its own session/process group so `make run` and its child processes can be stopped together. **Never** use broad-match kill commands (`pkill -f <generic substring>`, `killall`, `pkill node`, `pkill go`, `pkill ngrok`, etc.) in this workflow — a broad pattern can match unrelated processes, including the Claude Code CLI's own process tree, and kill it.
 
-0. **Prepare the working directory**: Run `mkdir -p /tmp/ci-chat-bot` before starting anything. All logs and PID files for this workflow live under this one directory rather than scattered directly in `/tmp`.
+0. **Prepare the working directory**: Set a restrictive umask before creating any files and ensure the directory is owned by you with owner-only permissions, even if it already exists:
+   ```bash
+   umask 077
+   if [ -L /tmp/ci-chat-bot ] || ! mkdir -p -- /tmp/ci-chat-bot ||
+      [ ! -O /tmp/ci-chat-bot ] || ! chmod 700 -- /tmp/ci-chat-bot; then
+     echo "Cannot secure /tmp/ci-chat-bot; stop and inspect it manually."
+     exit 1
+   fi
+   ```
+   Use `umask 077` in every shell that creates workflow files. All logs and PID files for this workflow live under this one directory rather than scattered directly in `/tmp`.
 
 1. **Check Environment Variables**: First ask the user if they want to load environment variables from a file.
 
@@ -214,10 +223,29 @@ fi
 
 if [ -f /tmp/ci-chat-bot/ngrok.pid ]; then
   PID=$(cat /tmp/ci-chat-bot/ngrok.pid)
-  if ps -p "$PID" -o cmd= | grep -q "ngrok"; then
-    kill "$PID"
+  if [[ ! "$PID" =~ ^[1-9][0-9]*$ ]]; then
+    echo "Invalid PID in ngrok.pid; not killing. Inspect manually."
+  elif ps -p "$PID" -o comm=,args= | awk '
+    $1 == "ngrok" && $2 ~ /(^|\/)ngrok$/ && $3 == "http" && $4 == "8080" && NF == 4 { found=1 }
+    END { exit !found }
+  '; then
+    if kill -TERM -- "$PID"; then
+      for attempt in {1..30}; do
+        if ! ps -p "$PID" -o stat= | awk '$1 !~ /^Z/ { found=1 } END { exit !found }'; then
+          break
+        fi
+        sleep 1
+      done
+      if ps -p "$PID" -o stat= | awk '$1 !~ /^Z/ { found=1 } END { exit !found }'; then
+        echo "ngrok process $PID is still running; inspect it manually."
+      else
+        rm -f /tmp/ci-chat-bot/ngrok.pid
+      fi
+    else
+      echo "Could not signal ngrok process $PID; keeping ngrok.pid. Inspect manually."
+    fi
   else
-    echo "PID $PID does not look like the ngrok process; not killing. Inspect manually."
+    echo "PID $PID is not the expected ngrok http 8080 process; not killing. Inspect manually."
   fi
 fi
 ```

@@ -236,7 +236,7 @@ func (b *Bot) SupportedCommands() []parser.BotCommand {
 			Handler:     AroHcpCreate,
 		}, false),
 		parser.NewBotCommand("aro-hcp auth", &parser.CommandDefinition{
-			Description: "Re-send the aro-creds file for your running ARO-HCP managed service environment.",
+			Description: "Re-send the service-cluster and management-cluster kubeconfigs for your running ARO-HCP managed service environment.",
 			Handler:     AroHcpAuth,
 		}, false),
 		parser.NewBotCommand("aro-hcp delete", &parser.CommandDefinition{
