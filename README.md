@@ -11,3 +11,4 @@ For any questions, concerns, comments, etc, please reach out in the `#forum-ocp-
 ## Links
 * [OpenShift Releases](https://amd64.ocp.releases.ci.openshift.org/)
 * [Frequently Asked Questions](docs/FAQ.md)
+* [MCP integration and Chai connection](docs/MCP.md)

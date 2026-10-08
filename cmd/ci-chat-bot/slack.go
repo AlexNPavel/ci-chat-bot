@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/openshift/ci-chat-bot/pkg/manager"
+	clusterMCP "github.com/openshift/ci-chat-bot/pkg/mcp"
 	chatmetrics "github.com/openshift/ci-chat-bot/pkg/metrics"
 	"github.com/openshift/ci-chat-bot/pkg/slack"
 	eventhandler "github.com/openshift/ci-chat-bot/pkg/slack/events"
@@ -31,12 +32,7 @@ func l(fragment string, children ...simplifypath.Node) simplifypath.Node {
 	return simplifypath.L(fragment, children...)
 }
 
-func Start(bot *slack.Bot, jobManager manager.JobManager, httpclient *http.Client, health *pjutil.Health, iOpts prowflagutil.InstrumentationOptions, clusterBotMetrics *metrics.Metrics, commandRecorders ...chatmetrics.CommandRecorder) {
-	slackclient := slackClient.New(bot.BotToken)
-	jobManager.SetNotifier(bot.JobResponder(slackclient))
-	jobManager.SetRosaNotifier(bot.RosaResponder(slackclient))
-	jobManager.SetMceNotifier(bot.MceResponder(slackclient))
-
+func Start(bot *slack.Bot, jobManager manager.JobManager, slackclient *slackClient.Client, httpclient *http.Client, mcpHandler http.Handler, health *pjutil.Health, iOpts prowflagutil.InstrumentationOptions, clusterBotMetrics *metrics.Metrics, commandRecorders ...chatmetrics.CommandRecorder) {
 	metrics.ExposeMetrics("ci-chat-bot", config.PushGateway{}, iOpts.MetricsPort)
 	simplifier := simplifypath.NewSimplifier(l("", // shadow element mimicking the root
 		l(""),       // for black-box health checks
@@ -44,6 +40,7 @@ func Start(bot *slack.Bot, jobManager manager.JobManager, httpclient *http.Clien
 		l("slack",
 			l("events-endpoint"),
 		),
+		l("mcp"),
 	))
 	handler := metrics.TraceHandler(simplifier, clusterBotMetrics.HTTPRequestDuration, clusterBotMetrics.HTTPResponseSize)
 	pprof.Instrument(iOpts)
@@ -53,6 +50,11 @@ func Start(bot *slack.Bot, jobManager manager.JobManager, httpclient *http.Clien
 	mux.Handle("/readyz", handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))) // report ready once the server is up and responding
 	mux.Handle("/slack/events-endpoint", handler(handleEvent(bot.BotSigningSecret, eventrouter.ForEvents(slackclient, jobManager, bot.SupportedCommands(), commandRecorders...))))
 	mux.Handle("/slack/interactive-endpoint", handler(handleInteraction(bot.BotSigningSecret, interactionrouter.ForModals(slackclient, jobManager, httpclient))))
+	if mcpHandler == nil {
+		mcpHandler = clusterMCP.DisabledHandler()
+	}
+	mux.Handle("/mcp", handler(mcpHandler))
+	mux.Handle("/mcp/", handler(http.NotFoundHandler()))
 	server := &http.Server{Addr: ":" + strconv.Itoa(bot.Port), Handler: mux, ReadHeaderTimeout: 10 * time.Second}
 	health.ServeReady(func() bool {
 		resp, err := http.DefaultClient.Get("http://127.0.0.1:" + strconv.Itoa(bot.Port) + "/readyz")
