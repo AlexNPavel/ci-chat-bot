@@ -277,6 +277,7 @@ type jobManager struct {
 	requests             map[string]*JobRequest
 	jobs                 map[string]*Job
 	started              time.Time
+	launchReady          bool
 	recentStartEstimates []time.Duration
 
 	clusterPrefix string
@@ -300,6 +301,8 @@ type jobManager struct {
 		lock    sync.Mutex
 		running map[string]struct{}
 	}
+
+	lifecycleLocks keyedMutex
 
 	jobNotifierFn  JobCallbackFunc
 	workflowConfig *WorkflowConfig
@@ -386,8 +389,12 @@ type JobRequest struct {
 	JobName   string
 	JobParams map[string]string
 
-	Architecture       string
-	ManagedClusterName string
+	Architecture         string
+	ManagedClusterName   string
+	RequestKeyHash       string
+	InputFingerprint     string
+	RequestSource        string
+	SubmissionInProgress bool
 }
 
 type JobType string
@@ -472,7 +479,16 @@ type Job struct {
 
 	Credentials        string
 	CredentialsSnippet string
-	Failure            string
+	// Structured access details are populated by the existing launch monitor.
+	// Credentials remains the kubeconfig used by legacy Slack auth responses.
+	ConsoleURL           string
+	APIURL               string
+	ConsoleUsername      string
+	ConsolePassword      string
+	AccessInstructions   string
+	CompletedAt          *time.Time
+	TerminationRequested bool
+	Failure              string
 
 	RequestedBy      string
 	RequesterUserID  string
@@ -498,6 +514,9 @@ type Job struct {
 	CatalogError    bool
 
 	ManagedClusterName string
+	RequestKeyHash     string
+	InputFingerprint   string
+	RequestSource      string
 }
 
 type OperatorInfo struct {

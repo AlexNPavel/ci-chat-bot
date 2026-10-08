@@ -19,12 +19,14 @@ import (
 	"github.com/adrg/xdg"
 	orgdatacore "github.com/openshift-eng/cyborg-data/go"
 	"github.com/openshift/ci-chat-bot/pkg/manager"
+	clusterMCP "github.com/openshift/ci-chat-bot/pkg/mcp"
 	chatmetrics "github.com/openshift/ci-chat-bot/pkg/metrics"
 	"github.com/openshift/ci-chat-bot/pkg/slack"
 	"github.com/openshift/ci-chat-bot/pkg/utils"
 	botversion "github.com/openshift/ci-chat-bot/pkg/version"
 	"github.com/openshift/rosa/pkg/rosa"
 	"github.com/prometheus/client_golang/prometheus"
+	slackClient "github.com/slack-go/slack"
 
 	"sigs.k8s.io/prow/pkg/config/secret"
 	"sigs.k8s.io/prow/pkg/flagutil"
@@ -78,6 +80,8 @@ type options struct {
 	WorkflowConfigPath       string
 	Port                     int
 	GracePeriod              time.Duration
+	MCPTokenFile             string
+	MCPPublicURL             string
 
 	leaseServer                string
 	leaseServerCredentialsFile string
@@ -94,6 +98,9 @@ type options struct {
 }
 
 func (o *options) Validate() error {
+	if err := clusterMCP.ValidateEndpointConfig(o.MCPTokenFile, o.MCPPublicURL); err != nil {
+		return err
+	}
 	if o.ReleaseClusterKubeconfig != "" {
 		if _, err := os.Stat(o.ReleaseClusterKubeconfig); err != nil {
 			return fmt.Errorf("error accessing --release-cluster-kubeconfig: %w", err)
@@ -137,6 +144,8 @@ func run() error {
 	pflag.StringVar(&opt.WorkflowConfigPath, "workflow-config-path", "", "Path to config file used for workflow commands")
 	pflag.IntVar(&opt.Port, "port", 8080, "Port to listen on.")
 	pflag.DurationVar(&opt.GracePeriod, "grace-period", 5*time.Second, "On shutdown, try to handle remaining events for the specified duration.")
+	pflag.StringVar(&opt.MCPTokenFile, "mcp-token-file", "", "Path to the bearer token file that enables the MCP endpoint. Omit to disable MCP.")
+	pflag.StringVar(&opt.MCPPublicURL, "mcp-public-url", "", "Public HTTPS URL for the MCP endpoint, ending in the exact /mcp path.")
 	pflag.StringVar(&opt.leaseServer, "lease-server", citools.URLForService(citools.ServiceBoskos), "Address of the server that manages leases. Used to identify accounts with more available leases.")
 	pflag.StringVar(&opt.leaseServerCredentialsFile, "lease-server-credentials-file", "", "The path to credentials file used to access the lease server. The content is of the form <username>:<password>.")
 	pflag.StringVar(&opt.overrideLaunchLabel, "override-launch-label", "", "Override the default launch label for jobs. Used for local debugging.")
@@ -177,6 +186,14 @@ func run() error {
 
 	if err := opt.Validate(); err != nil {
 		return fmt.Errorf("unable to validate program arguments: %w", err)
+	}
+	if opt.MCPTokenFile != "" {
+		if err := secret.Add(opt.MCPTokenFile); err != nil {
+			return fmt.Errorf("unable to load --mcp-token-file: %w", err)
+		}
+		if len(secret.GetSecret(opt.MCPTokenFile)) == 0 {
+			return fmt.Errorf("--mcp-token-file must contain a non-empty bearer token")
+		}
 	}
 
 	commandUsageMetrics, err := chatmetrics.New(prometheus.DefaultRegisterer)
@@ -425,6 +442,29 @@ func run() error {
 		orgDataService,
 	)
 
+	bot := slack.NewBot(botToken, botSigningSecret, opt.GracePeriod, opt.Port, &workflows)
+	httpClient := &http.Client{Timeout: 60 * time.Second}
+	slackAPI := slackClient.New(bot.BotToken, slackClient.OptionHTTPClient(httpClient))
+	// Install callbacks before Start reconstructs existing jobs and invokes
+	// recovery notifications.
+	jobManager.SetNotifier(bot.JobResponder(slackAPI))
+	jobManager.SetRosaNotifier(bot.RosaResponder(slackAPI))
+	jobManager.SetMceNotifier(bot.MceResponder(slackAPI))
+
+	mcpHandler := clusterMCP.DisabledHandler()
+	if opt.MCPTokenFile != "" {
+		mcpHandler, err = clusterMCP.NewHandler(clusterMCP.Config{
+			Token:          secret.GetTokenGenerator(opt.MCPTokenFile),
+			PublicURL:      opt.MCPPublicURL,
+			ClusterManager: jobManager,
+			SlackClient:    slackAPI,
+			Metrics:        commandUsageMetrics,
+		})
+		if err != nil {
+			return fmt.Errorf("unable to initialize MCP endpoint: %w", err)
+		}
+	}
+
 	klog.Infof("Waiting for caches to sync")
 	cache.WaitForCacheSync(ctx.Done(), hasSynced...)
 
@@ -432,9 +472,7 @@ func run() error {
 		return fmt.Errorf("unable to load initial configuration: %w", err)
 	}
 
-	bot := slack.NewBot(botToken, botSigningSecret, opt.GracePeriod, opt.Port, &workflows)
-	httpClient := &http.Client{Timeout: 60 * time.Second}
-	Start(bot, jobManager, httpClient, health, opt.InstrumentationOptions, clusterBotMetrics, commandUsageMetrics)
+	Start(bot, jobManager, slackAPI, httpClient, mcpHandler, health, opt.InstrumentationOptions, clusterBotMetrics, commandUsageMetrics)
 
 	return nil
 }

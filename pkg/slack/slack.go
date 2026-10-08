@@ -670,49 +670,9 @@ func ParseOptions(options string, inputs [][]string, jobType manager.JobType) (s
 				strings.Join(manager.SupportedParameters, ", "))
 		}
 	}
-	if len(platform) == 0 {
-		switch architecture {
-		case "", "multi":
-			// for hypershift, only support normal launches
-			if jobType == manager.JobTypeInstall || jobType == manager.JobTypeLaunch {
-				// only use hypershift for supported versions
-				manager.HypershiftSupportedVersions.Mu.RLock()
-				defer manager.HypershiftSupportedVersions.Mu.RUnlock()
-				var validVersion bool
-				if len(inputs) == 1 {
-					for version := range manager.HypershiftSupportedVersions.Versions {
-						if strings.HasPrefix(inputs[0][0], version) {
-							validVersion = true
-							break
-						}
-					}
-				}
-				if validVersion {
-					platform = "hypershift-hosted"
-				} else if manager.HypershiftSupportedVersions.Versions.Has(fmt.Sprintf("%d.%d", manager.CurrentRelease.Major, manager.CurrentRelease.Minor)) &&
-					(len(inputs) == 0 || inputs[0][0] == "nightly" || inputs[0][0] == "ci" || inputs[0][0] == "prerelease") {
-					platform = "hypershift-hosted"
-				} else {
-					platform = "aws"
-				}
-			} else {
-				platform = "aws"
-			}
-		case "amd64", "arm64":
-			platform = "aws"
-		default:
-			return "", "", nil, fmt.Errorf("unknown architecture: %s", architecture)
-		}
-	}
-	if architecture == "" {
-		if platform == "hypershift-hosted" {
-			architecture = "multi"
-		} else {
-			architecture = "amd64"
-		}
-	}
-	if architecture != "multi" && platform == "hypershift-hosted" {
-		return "", "", nil, fmt.Errorf("The hypershift-hosted platform requires a multiarch image. See: https://docs.ci.openshift.org/docs/architecture/ci-operator/#testing-with-a-cluster-from-hypershift") //nolint:staticcheck
+	platform, architecture, params, err = manager.NormalizeClusterLaunchOptions(inputs, platform, architecture, params, jobType)
+	if err != nil {
+		return "", "", nil, err
 	}
 	return platform, architecture, params, nil
 }
