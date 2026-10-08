@@ -260,6 +260,18 @@ func TestParseOptionsWithSuggestions(t *testing.T) {
 			expectError:   true,
 			errorContains: "Did you mean", // Should suggest for first one
 		},
+		{
+			name:          "Launch rejects TestUpgrade option through shared validation",
+			options:       "test=e2e",
+			expectError:   true,
+			errorContains: "TestUpgrade arguments may not be passed",
+		},
+		{
+			name:          "HyperShift requires multiarch through shared validation",
+			options:       "hypershift-hosted,amd64",
+			expectError:   true,
+			errorContains: "requires a multiarch image",
+		},
 	}
 
 	for _, tc := range testCases {

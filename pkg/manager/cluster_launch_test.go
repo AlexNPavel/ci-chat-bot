@@ -1,0 +1,994 @@
+package manager
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/openshift/ci-chat-bot/pkg/utils"
+	imagefake "github.com/openshift/client-go/image/clientset/versioned/fake"
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	k8stesting "k8s.io/client-go/testing"
+	prowapiv1 "sigs.k8s.io/prow/pkg/apis/prowjobs/v1"
+	prowfake "sigs.k8s.io/prow/pkg/client/clientset/versioned/fake"
+	prowconfig "sigs.k8s.io/prow/pkg/config"
+	"sigs.k8s.io/prow/pkg/scheduler/strategy"
+)
+
+const launchTestImage = "quay.io/openshift-release-dev/ocp-release:4.18.2"
+
+var prowJobsResource = schema.GroupVersionResource{Group: "prow.k8s.io", Version: "v1", Resource: "prowjobs"}
+
+type staticLaunchProwConfig struct {
+	config *prowconfig.Config
+}
+
+func (c staticLaunchProwConfig) Config() *prowconfig.Config { return c.config }
+
+type clusterLaunchFixture struct {
+	manager     *jobManager
+	client      *prowfake.Clientset
+	created     atomic.Bool
+	createCount atomic.Int32
+	createHook  func(k8stesting.Action) (bool, runtime.Object, error)
+}
+
+func newClusterLaunchFixture(maxClusters int, objects ...runtime.Object) *clusterLaunchFixture {
+	client := prowfake.NewSimpleClientset(objects...)
+	loader := staticLaunchProwConfig{config: &prowconfig.Config{
+		JobConfig: prowconfig.JobConfig{Periodics: []prowconfig.Periodic{{
+			JobBase: prowconfig.JobBase{
+				Name:    "periodic-launch",
+				Cluster: "build-cluster",
+				Labels: map[string]string{
+					"job-env":          "aws",
+					"job-type":         "launch",
+					"config-type":      "modern",
+					"job-architecture": "amd64",
+				},
+				Spec: &corev1.PodSpec{Containers: []corev1.Container{{
+					Name: "test",
+					Env: []corev1.EnvVar{{
+						Name:  "CONFIG_SPEC",
+						Value: `{"tests":[{"as":"launch","steps":{"cluster_profile":"default","test":[{"ref":"clusterbot-wait"}]}}]}`,
+					}},
+				}}},
+				UtilityConfig: prowconfig.UtilityConfig{DecorationConfig: &prowapiv1.DecorationConfig{}},
+			},
+		}}},
+	}}
+	if maxClusters <= 0 {
+		maxClusters = 80
+	}
+	m := &jobManager{
+		requests:         make(map[string]*JobRequest),
+		jobs:             make(map[string]*Job),
+		launchReady:      true,
+		clusterPrefix:    "chat-bot",
+		maxClusters:      maxClusters,
+		maxAge:           3 * time.Hour,
+		prowConfigLoader: loader,
+		prowClient:       client.ProwV1(),
+		prowNamespace:    "ci",
+		clusterClients:   utils.BuildClusterClientConfigMap{"build-cluster": {}},
+		prowScheduler:    &strategy.Passthrough{},
+		muJob: struct {
+			lock    sync.Mutex
+			running map[string]struct{}
+		}{running: make(map[string]struct{})},
+	}
+	f := &clusterLaunchFixture{manager: m, client: client}
+	client.PrependReactor("create", "prowjobs", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		f.createCount.Add(1)
+		f.created.Store(true)
+		if f.createHook != nil {
+			return f.createHook(action)
+		}
+		return false, nil, nil
+	})
+	client.PrependReactor("get", "prowjobs", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		if f.created.Load() {
+			if getAction, ok := action.(k8stesting.GetAction); ok {
+				m.tryJob(getAction.GetName())
+			}
+		}
+		return false, nil, nil
+	})
+	return f
+}
+
+func launchTestRequest(user, requestID string, inputs ...string) ClusterLaunchRequest {
+	return ClusterLaunchRequest{
+		ServicePrincipal: "chai",
+		SlackUserID:      user,
+		UserName:         "redhat-user",
+		RequestID:        requestID,
+		Inputs:           inputs,
+		Platform:         "aws",
+		Architecture:     "amd64",
+		Parameters:       map[string]string{"no-spot": ""},
+	}
+}
+
+func successfulDMRequest(user, requestID string, inputs ...string) (ClusterLaunchRequest, *atomic.Int32) {
+	req := launchTestRequest(user, requestID, inputs...)
+	var calls atomic.Int32
+	req.ResolveDM = func(context.Context) (string, error) {
+		calls.Add(1)
+		return "D-" + user, nil
+	}
+	return req, &calls
+}
+
+func launchToolError(t *testing.T, err error) *ToolError {
+	t.Helper()
+	var toolErr *ToolError
+	if !errors.As(err, &toolErr) {
+		t.Fatalf("expected ToolError, got %T: %v", err, err)
+	}
+	return toolErr
+}
+
+func addDurableLaunch(f *clusterLaunchFixture, req ClusterLaunchRequest, state prowapiv1.ProwJobState, createdAt time.Time) *prowapiv1.ProwJob {
+	fingerprint := launchInputFingerprint(req.Inputs, req.Platform, req.Architecture, req.Parameters)
+	keyHash := requestKeyHash(req.ServicePrincipal, req.SlackUserID, req.RequestID)
+	inputs, _ := json.Marshal([]JobInput{{Version: "4.18.2", Image: launchTestImage}})
+	annotations := map[string]string{
+		"ci-chat-bot.openshift.io/mode":            JobTypeLaunch,
+		"ci-chat-bot.openshift.io/user":            req.SlackUserID,
+		"ci-chat-bot.openshift.io/requesterUserID": req.UserName,
+		"ci-chat-bot.openshift.io/channel":         "D-" + req.SlackUserID,
+		"ci-chat-bot.openshift.io/platform":        "aws",
+		"release.openshift.io/architecture":        "amd64",
+		"ci-chat-bot.openshift.io/jobInputs":       string(inputs),
+		"ci-chat-bot.openshift.io/jobParams":       paramsToString(req.Parameters),
+		"ci-chat-bot.openshift.io/expires":         strconv.Itoa(int((3 * time.Hour).Seconds())),
+		annotationRequestKeyHash:                   keyHash,
+		annotationInputFingerprint:                 fingerprint,
+		annotationRawInputFingerprint:              fingerprint,
+		annotationRequestSource:                    requestSourceMCP,
+	}
+	name := deterministicProwJobName(f.manager.clusterPrefix, keyHash)
+	pj := &prowapiv1.ProwJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              name,
+			Namespace:         "ci",
+			CreationTimestamp: metav1.NewTime(createdAt),
+			Labels:            map[string]string{utils.LaunchLabel: "true"},
+			Annotations:       annotations,
+		},
+		Spec:   prowapiv1.ProwJobSpec{Job: "periodic-launch"},
+		Status: prowapiv1.ProwJobStatus{State: state, URL: ""},
+	}
+	if state == prowapiv1.SuccessState || state == prowapiv1.FailureState || state == prowapiv1.AbortedState {
+		completedAt := metav1.NewTime(createdAt.Add(time.Minute))
+		pj.Status.CompletionTime = &completedAt
+	}
+	if err := f.client.Tracker().Create(prowJobsResource, pj, "ci"); err != nil {
+		panic(fmt.Sprintf("failed to seed durable ProwJob: %v", err))
+	}
+	return pj
+}
+
+func TestSubmitClusterAcceptsProwJobBeforeLogsURLAndPersistsMetadata(t *testing.T) {
+	f := newClusterLaunchFixture(2)
+	req, dmCalls := successfulDMRequest("U123", "request-accepted", launchTestImage)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	result, err := f.manager.SubmitCluster(ctx, req)
+	if err != nil {
+		t.Fatalf("SubmitCluster returned error: %v", err)
+	}
+	if result.Replayed || result.Cluster.Status != clusterStatusProvisioning || result.Cluster.LogsURL != "" {
+		t.Fatalf("SubmitCluster result = %#v; expected an accepted provisioning job without a logs URL", result)
+	}
+	if dmCalls.Load() != 1 || f.createCount.Load() != 1 {
+		t.Fatalf("DM calls = %d, Prow creates = %d; want one each", dmCalls.Load(), f.createCount.Load())
+	}
+	if result.Cluster.JobID != deterministicProwJobName(f.manager.clusterPrefix, requestKeyHash("chai", "U123", req.RequestID)) {
+		t.Fatalf("job ID = %q; expected a deterministic request-scoped ID", result.Cluster.JobID)
+	}
+
+	pj, err := f.client.ProwV1().ProwJobs("ci").Get(context.Background(), result.Cluster.JobID, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("could not read accepted ProwJob: %v", err)
+	}
+	wantFingerprint := launchInputFingerprint(req.Inputs, req.Platform, req.Architecture, req.Parameters)
+	wantKeyHash := requestKeyHash(req.ServicePrincipal, req.SlackUserID, req.RequestID)
+	wantExpiry := strconv.Itoa(int((f.manager.maxAge + 45*time.Minute).Seconds()))
+	for annotation, want := range map[string]string{
+		"ci-chat-bot.openshift.io/user":            "U123",
+		"ci-chat-bot.openshift.io/requesterUserID": "redhat-user",
+		"ci-chat-bot.openshift.io/channel":         "D-U123",
+		"ci-chat-bot.openshift.io/mode":            JobTypeLaunch,
+		annotationRequestKeyHash:                   wantKeyHash,
+		annotationInputFingerprint:                 wantFingerprint,
+		annotationRawInputFingerprint:              wantFingerprint,
+		annotationRequestSource:                    requestSourceMCP,
+		"ci-chat-bot.openshift.io/expires":         wantExpiry,
+	} {
+		if got := pj.Annotations[annotation]; got != want {
+			t.Errorf("annotation %q = %q, want %q", annotation, got, want)
+		}
+	}
+	if pj.Labels[utils.LaunchLabel] != "true" {
+		t.Errorf("launch label = %q, want true", pj.Labels[utils.LaunchLabel])
+	}
+	annotationData, _ := json.Marshal(pj.Annotations)
+	if strings.Contains(string(annotationData), req.RequestID) {
+		t.Errorf("ProwJob annotations contain raw request ID %q", req.RequestID)
+	}
+}
+
+func TestSubmitClusterReplaysTerminalProwJobAfterRestartBeforeDMOrResolution(t *testing.T) {
+	req, dmCalls := successfulDMRequest("U123", "request-replay", "nightly")
+	f := newClusterLaunchFixture(2)
+	seeded := addDurableLaunch(f, req, prowapiv1.SuccessState, time.Now().Add(-2*time.Minute))
+
+	// A missing release-image client proves recovery happens before dynamic
+	// input resolution. The replay must also avoid opening a second Slack DM.
+	imageClient := imagefake.NewClientset()
+	var imageLookups atomic.Int32
+	imageClient.PrependReactor("get", "imagestreams", func(k8stesting.Action) (bool, runtime.Object, error) {
+		imageLookups.Add(1)
+		return true, nil, apierrors.NewNotFound(schema.GroupResource{Resource: "imagestreams"}, "release")
+	})
+	f.manager.imageClient = imageClient
+	result, err := f.manager.SubmitCluster(context.Background(), req)
+	if err != nil {
+		t.Fatalf("SubmitCluster replay returned error: %v", err)
+	}
+	if !result.Replayed || result.Cluster.JobID != seeded.Name || result.Cluster.Status != clusterStatusTerminated {
+		t.Fatalf("replayed terminal result = %#v", result)
+	}
+	if dmCalls.Load() != 0 || imageLookups.Load() != 0 || f.createCount.Load() != 0 {
+		t.Fatalf("replay did unexpected work: DM calls=%d image lookups=%d creates=%d", dmCalls.Load(), imageLookups.Load(), f.createCount.Load())
+	}
+}
+
+func TestSubmitClusterScopesRequestIDByPrincipalAndSlackUser(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		seedPrincipal   string
+		seedUser        string
+		submitPrincipal string
+		submitUser      string
+	}{
+		{name: "service principal", seedPrincipal: "chai", seedUser: "U123", submitPrincipal: "another-service", submitUser: "U123"},
+		{name: "Slack user", seedPrincipal: "chai", seedUser: "U123", submitPrincipal: "chai", submitUser: "U456"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newClusterLaunchFixture(2)
+			original := launchTestRequest(tc.seedUser, "request-scoped", launchTestImage)
+			original.ServicePrincipal = tc.seedPrincipal
+			seeded := addDurableLaunch(f, original, prowapiv1.SuccessState, time.Now().Add(-2*time.Minute))
+
+			request, dmCalls := successfulDMRequest(tc.submitUser, "request-scoped", launchTestImage)
+			request.ServicePrincipal = tc.submitPrincipal
+			result, err := f.manager.SubmitCluster(context.Background(), request)
+			if err != nil {
+				t.Fatalf("SubmitCluster returned error: %v", err)
+			}
+			if result.Replayed || result.Cluster.JobID == seeded.Name {
+				t.Fatalf("request ID crossed its %s scope: %#v, seeded job %q", tc.name, result, seeded.Name)
+			}
+			if dmCalls.Load() != 1 || f.createCount.Load() != 1 {
+				t.Fatalf("scoped request did not create independently: DM=%d Prow creates=%d", dmCalls.Load(), f.createCount.Load())
+			}
+		})
+	}
+}
+
+func TestSubmitClusterRejectsConflictingArgumentsForExistingRequestID(t *testing.T) {
+	f := newClusterLaunchFixture(2)
+	first, dmCalls := successfulDMRequest("U123", "request-conflict", launchTestImage)
+	if _, err := f.manager.SubmitCluster(context.Background(), first); err != nil {
+		t.Fatalf("initial SubmitCluster returned error: %v", err)
+	}
+	second, _ := successfulDMRequest("U123", "request-conflict", "quay.io/openshift-release-dev/ocp-release:4.19.0")
+	_, err := f.manager.SubmitCluster(context.Background(), second)
+	toolErr := launchToolError(t, err)
+	if toolErr.Code != ToolErrorCodeRequestConflict || toolErr.Retryable {
+		t.Fatalf("conflicting request error = %#v", toolErr)
+	}
+	if dmCalls.Load() != 1 || f.createCount.Load() != 1 {
+		t.Fatalf("conflict should not open another DM or create a ProwJob: DM calls=%d creates=%d", dmCalls.Load(), f.createCount.Load())
+	}
+}
+
+func TestSubmitClusterReplaysDefaultedPlatformArguments(t *testing.T) {
+	f := newClusterLaunchFixture(2)
+	first, dmCalls := successfulDMRequest("U123", "request-defaulted", launchTestImage)
+	first.Platform = ""
+	first.Architecture = ""
+	initial, err := f.manager.SubmitCluster(context.Background(), first)
+	if err != nil {
+		t.Fatalf("initial SubmitCluster returned error: %v", err)
+	}
+	retry, _ := successfulDMRequest("U123", "request-defaulted", launchTestImage)
+	retry.Platform = "aws"
+	retry.Architecture = "amd64"
+	result, err := f.manager.SubmitCluster(context.Background(), retry)
+	if err != nil {
+		t.Fatalf("retry with explicit defaults returned error: %v", err)
+	}
+	if !result.Replayed || result.Cluster.JobID != initial.Cluster.JobID {
+		t.Fatalf("retry result = %#v, want a replay of %q", result, initial.Cluster.JobID)
+	}
+	if dmCalls.Load() != 1 || f.createCount.Load() != 1 {
+		t.Fatalf("retry with explicit defaults made DM=%d Prow creates=%d; want one each", dmCalls.Load(), f.createCount.Load())
+	}
+}
+
+func TestSubmitClusterReconcilesAlreadyExistsAndAmbiguousCreateErrors(t *testing.T) {
+	tests := []struct {
+		name      string
+		createErr error
+	}{
+		{name: "already exists", createErr: apierrors.NewAlreadyExists(prowJobsResource.GroupResource(), "pending")},
+		{name: "connection reset", createErr: errors.New("connection reset by peer")},
+		{name: "ambiguous timeout", createErr: context.DeadlineExceeded},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newClusterLaunchFixture(2)
+			req, dmCalls := successfulDMRequest("U123", "request-"+stringsToName(tc.name), launchTestImage)
+			f.createHook = func(action k8stesting.Action) (bool, runtime.Object, error) {
+				createAction := action.(k8stesting.CreateAction)
+				obj := createAction.GetObject().DeepCopyObject()
+				if err := f.client.Tracker().Create(prowJobsResource, obj, "ci"); err != nil {
+					return true, nil, err
+				}
+				return true, nil, tc.createErr
+			}
+
+			result, err := f.manager.SubmitCluster(context.Background(), req)
+			if err != nil {
+				t.Fatalf("SubmitCluster did not reconcile %s: %v", tc.name, err)
+			}
+			if !result.Replayed || result.Cluster.JobID == "" {
+				t.Fatalf("reconciled result = %#v; expected the durable job to be replayed", result)
+			}
+			if dmCalls.Load() != 1 || f.createCount.Load() != 1 {
+				t.Fatalf("unexpected calls after reconciliation: DM=%d create=%d", dmCalls.Load(), f.createCount.Load())
+			}
+		})
+	}
+}
+
+func stringsToName(value string) string {
+	result := make([]rune, 0, len(value))
+	for _, r := range value {
+		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' {
+			result = append(result, r)
+		} else {
+			result = append(result, '-')
+		}
+	}
+	return string(result)
+}
+
+func TestSubmitClusterConcurrentIdenticalRequestsCreateAtMostOneProwJob(t *testing.T) {
+	f := newClusterLaunchFixture(2)
+	request, dmCalls := successfulDMRequest("U123", "request-concurrent-same", launchTestImage)
+	dmEntered := make(chan struct{}, 2)
+	releaseDM := make(chan struct{})
+	request.ResolveDM = func(context.Context) (string, error) {
+		dmCalls.Add(1)
+		dmEntered <- struct{}{}
+		<-releaseDM
+		return "D-U123", nil
+	}
+
+	start := make(chan struct{})
+	type outcome struct {
+		result LaunchResult
+		err    error
+	}
+	outcomes := make(chan outcome, 2)
+	var workers sync.WaitGroup
+	workers.Add(2)
+	for range 2 {
+		go func() {
+			defer workers.Done()
+			<-start
+			result, err := f.manager.SubmitCluster(context.Background(), request)
+			outcomes <- outcome{result: result, err: err}
+		}()
+	}
+	close(start)
+	<-dmEntered
+
+	var first outcome
+	select {
+	case first = <-outcomes:
+	case <-time.After(5 * time.Second):
+		close(releaseDM)
+		workers.Wait()
+		t.Fatal("second identical request did not return while the first was resolving its DM")
+	}
+	if first.err == nil {
+		t.Fatal("concurrent identical submission unexpectedly created two in-flight launch attempts")
+	}
+	toolErr := launchToolError(t, first.err)
+	if toolErr.Code != ToolErrorCodeLaunchInitialization || !toolErr.Retryable {
+		t.Fatalf("concurrent duplicate error = %#v", toolErr)
+	}
+	close(releaseDM)
+	second := <-outcomes
+	workers.Wait()
+	if second.err != nil || second.result.Cluster.JobID == "" || second.result.Replayed {
+		t.Fatalf("first accepted submission = result %#v, error %v", second.result, second.err)
+	}
+	if dmCalls.Load() != 1 || f.createCount.Load() != 1 {
+		t.Fatalf("identical concurrent requests made DM=%d Prow creates=%d; want one each", dmCalls.Load(), f.createCount.Load())
+	}
+}
+
+func TestSubmitClusterConcurrentUsersRespectCapacityWithoutStaleReservation(t *testing.T) {
+	f := newClusterLaunchFixture(1)
+	dmEntered := make(chan struct{}, 2)
+	releaseDM := make(chan struct{})
+	var dmCalls atomic.Int32
+	requestFor := func(user, requestID string) ClusterLaunchRequest {
+		req := launchTestRequest(user, requestID, launchTestImage)
+		req.ResolveDM = func(context.Context) (string, error) {
+			dmCalls.Add(1)
+			dmEntered <- struct{}{}
+			<-releaseDM
+			return "D-" + user, nil
+		}
+		return req
+	}
+
+	start := make(chan struct{})
+	type outcome struct {
+		user   string
+		result LaunchResult
+		err    error
+	}
+	outcomes := make(chan outcome, 2)
+	var workers sync.WaitGroup
+	workers.Add(2)
+	for _, request := range []ClusterLaunchRequest{
+		requestFor("U123", "request-capacity-a"),
+		requestFor("U456", "request-capacity-b"),
+	} {
+		go func() {
+			defer workers.Done()
+			<-start
+			result, err := f.manager.SubmitCluster(context.Background(), request)
+			outcomes <- outcome{user: request.SlackUserID, result: result, err: err}
+		}()
+	}
+	close(start)
+	<-dmEntered
+
+	var rejected outcome
+	select {
+	case rejected = <-outcomes:
+	case <-time.After(5 * time.Second):
+		close(releaseDM)
+		workers.Wait()
+		t.Fatal("capacity rejection did not occur while the winning request was waiting for its DM")
+	}
+	if rejected.err == nil {
+		t.Fatal("both concurrent users were admitted with capacity one")
+	}
+	rejectedError := launchToolError(t, rejected.err)
+	if rejectedError.Code != ToolErrorCodeCapacityExhausted || !rejectedError.Retryable || rejectedError.JobID != "" {
+		t.Fatalf("capacity error = %#v, want a retryable error without a job ID", rejectedError)
+	}
+	close(releaseDM)
+	accepted := <-outcomes
+	workers.Wait()
+	if accepted.err != nil || accepted.result.Cluster.JobID == "" {
+		t.Fatalf("winning capacity request failed: result=%#v error=%v", accepted.result, accepted.err)
+	}
+	if dmCalls.Load() != 1 || f.createCount.Load() != 1 {
+		t.Fatalf("capacity race made DM=%d Prow creates=%d; want one each", dmCalls.Load(), f.createCount.Load())
+	}
+	f.manager.lock.RLock()
+	defer f.manager.lock.RUnlock()
+	if f.manager.requests[rejected.user] != nil {
+		t.Fatalf("rejected user %s retained a stale reservation: %#v", rejected.user, f.manager.requests[rejected.user])
+	}
+	if current := f.manager.requests[accepted.user]; current == nil || current.Name != accepted.result.Cluster.JobID {
+		t.Fatalf("accepted reservation missing for %s: %#v", accepted.user, current)
+	}
+}
+
+func TestActiveClusterAdmissionErrorReturnsOnlyAddressableJobIDs(t *testing.T) {
+	request := &JobRequest{User: "U123", RequestSource: requestSourceMCP}
+	for _, tc := range []struct {
+		name     string
+		existing *JobRequest
+		wantID   string
+	}{
+		{name: "ordinary launch", existing: &JobRequest{Name: "install-job", Type: JobTypeInstall}, wantID: "install-job"},
+		{name: "workflow launch", existing: &JobRequest{Name: "workflow-job", Type: JobTypeWorkflowLaunch}},
+		{name: "no existing request", existing: nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := (&jobManager{}).activeClusterAdmissionError(request, tc.existing)
+			toolErr := launchToolError(t, err)
+			if toolErr.Code != ToolErrorCodeActiveClusterExists || toolErr.Retryable || toolErr.JobID != tc.wantID {
+				t.Fatalf("admission error = %#v, want non-retryable ACTIVE_CLUSTER_EXISTS with job ID %q", toolErr, tc.wantID)
+			}
+		})
+	}
+}
+
+func TestSubmitClusterSharesAdmissionWithSlackAndRejectsSecondUserRequest(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		seedOwner string
+		requester string
+		wantCode  string
+	}{
+		{name: "Slack reservation blocks MCP", seedOwner: "U123", requester: "U123", wantCode: ToolErrorCodeActiveClusterExists},
+		{name: "another user's reservation does not block per-user admission", seedOwner: "U456", requester: "U123", wantCode: ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newClusterLaunchFixture(5)
+			seedName := "slack-active-" + tc.seedOwner
+			seed := cachedLifecycleJob(seedName, tc.seedOwner, time.Now())
+			seed.Credentials = ""
+			seed.CredentialsSnippet = ""
+			f.manager.jobs[seedName] = seed
+			f.manager.requests[tc.seedOwner] = &JobRequest{User: tc.seedOwner, Name: seedName, Type: JobTypeInstall, RequestedAt: time.Now()}
+
+			req, dmCalls := successfulDMRequest(tc.requester, "request-shared-admission-"+tc.requester+tc.seedOwner, launchTestImage)
+			result, err := f.manager.SubmitCluster(context.Background(), req)
+			if tc.wantCode != "" {
+				toolErr := launchToolError(t, err)
+				if toolErr.Code != tc.wantCode || dmCalls.Load() != 0 || f.createCount.Load() != 0 {
+					t.Fatalf("shared admission error=%#v dm=%d creates=%d", toolErr, dmCalls.Load(), f.createCount.Load())
+				}
+				if toolErr.JobID != seedName {
+					t.Fatalf("active cluster error job ID = %q, want the existing cluster %q", toolErr.JobID, seedName)
+				}
+				if f.manager.requests[tc.requester] == nil || f.manager.requests[tc.requester].Name != seedName {
+					t.Fatalf("existing shared reservation was modified: %#v", f.manager.requests[tc.requester])
+				}
+				return
+			}
+			if err != nil || result.Cluster.JobID == "" || f.createCount.Load() != 1 {
+				t.Fatalf("other user's reservation blocked launch: result=%#v error=%v creates=%d", result, err, f.createCount.Load())
+			}
+		})
+	}
+
+	// A second request ID from the same user is also rejected after an MCP
+	// launch has been accepted, matching the Slack per-user limit.
+	f := newClusterLaunchFixture(5)
+	first, dmCalls := successfulDMRequest("U123", "request-user-slot-one", launchTestImage)
+	if _, err := f.manager.SubmitCluster(context.Background(), first); err != nil {
+		t.Fatalf("first launch returned error: %v", err)
+	}
+	second, _ := successfulDMRequest("U123", "request-user-slot-two", launchTestImage)
+	_, err := f.manager.SubmitCluster(context.Background(), second)
+	toolErr := launchToolError(t, err)
+	if toolErr.Code != ToolErrorCodeActiveClusterExists || dmCalls.Load() != 1 || f.createCount.Load() != 1 {
+		t.Fatalf("second user launch was not blocked: error=%#v dm=%d creates=%d", toolErr, dmCalls.Load(), f.createCount.Load())
+	}
+}
+
+func TestSubmitClusterDMFailureRollsBackOnlyItsReservation(t *testing.T) {
+	f := newClusterLaunchFixture(2)
+	req := launchTestRequest("U123", "request-dm-failure", launchTestImage)
+	req.ResolveDM = func(context.Context) (string, error) { return "", errors.New("Slack unavailable") }
+	_, err := f.manager.SubmitCluster(context.Background(), req)
+	toolErr := launchToolError(t, err)
+	if toolErr.Code != ToolErrorCodeBackendUnavailable || !toolErr.Retryable {
+		t.Fatalf("DM failure = %#v", toolErr)
+	}
+	if f.manager.requests["U123"] != nil || len(f.manager.jobs) != 0 || f.createCount.Load() != 0 {
+		t.Fatalf("failed pre-submission request left state: requests=%#v jobs=%#v creates=%d", f.manager.requests, f.manager.jobs, f.createCount.Load())
+	}
+}
+
+func TestSelectLaunchJob(t *testing.T) {
+	tests := []struct {
+		name             string
+		architecture     string
+		wantProfileSet   string
+		wantBuildCluster string
+	}{
+		{name: "multi falls back to the amd64 launch job", architecture: "multi", wantBuildCluster: "build-cluster"},
+		{name: "amd64 uses the platform profile set", architecture: "amd64", wantProfileSet: "openshift-org-aws", wantBuildCluster: "build-cluster"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := newClusterLaunchFixture(1)
+			req := &JobRequest{Type: JobTypeInstall, Platform: "aws", Architecture: tt.architecture}
+			job := &Job{Mode: JobTypeLaunch, Inputs: []JobInput{{Version: "4.18.2"}}}
+			if err := selectLaunchJob(context.Background(), f.manager, req, job); err != nil {
+				t.Fatalf("selectLaunchJob() error = %v", err)
+			}
+			if job.JobName != "periodic-launch" || job.BuildCluster != tt.wantBuildCluster || job.CloudProfileSet != tt.wantProfileSet {
+				t.Fatalf("job = (%q, %q, %q), want (periodic-launch, %q, %q)", job.JobName, job.BuildCluster, job.CloudProfileSet, tt.wantBuildCluster, tt.wantProfileSet)
+			}
+		})
+	}
+
+	f := newClusterLaunchFixture(1)
+	err := selectLaunchJob(context.Background(), f.manager, &JobRequest{Type: JobTypeInstall, Platform: "gcp", Architecture: "amd64"}, &Job{Mode: JobTypeLaunch, Inputs: []JobInput{{Version: "4.18.2"}}})
+	if err == nil || !strings.Contains(err.Error(), "unable to find prow job") {
+		t.Fatalf("selectLaunchJob() error = %v, want a configuration error", err)
+	}
+}
+
+func slackLaunchTestRequest(user string) *JobRequest {
+	return &JobRequest{
+		User:         user,
+		UserName:     "redhat-user",
+		Inputs:       [][]string{{launchTestImage}},
+		Type:         JobTypeInstall,
+		Platform:     "aws",
+		Architecture: "amd64",
+		JobParams:    map[string]string{"no-spot": ""},
+		Channel:      "C-" + user,
+		RequestedAt:  time.Now(),
+	}
+}
+
+func TestSubmittedJobSnapshotIsNotSharedWithNewJob(t *testing.T) {
+	f := newClusterLaunchFixture(2)
+	job, err := prepareProwLaunch(context.Background(), f.manager, slackLaunchTestRequest("U123"))
+	if err != nil {
+		t.Fatalf("prepareProwLaunch() error = %v", err)
+	}
+	if job.ProwJobAccepted {
+		t.Fatal("prepared job was already accepted")
+	}
+
+	// Mirror launchJobForUserLegacy's store: the manager map gets a snapshot
+	// while newJobWithContext receives the caller's job and mutates it.
+	f.manager.lock.Lock()
+	f.manager.jobs[job.Name] = cloneJob(job)
+	f.manager.lock.Unlock()
+
+	stop := make(chan struct{})
+	readerDone := make(chan struct{})
+	go func() {
+		defer close(readerDone)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			_ = f.manager.cachedJobSnapshot(job.Name)
+		}
+	}()
+
+	_, err = f.manager.newJobWithContext(context.Background(), job, false)
+	close(stop)
+	<-readerDone
+	if err != nil {
+		t.Fatalf("newJobWithContext() error = %v", err)
+	}
+
+	if !job.ProwJobAccepted {
+		t.Fatal("newJobWithContext() did not record Prow acceptance on the submitted job")
+	}
+	stored := f.manager.cachedJobSnapshot(job.Name)
+	if stored == nil {
+		t.Fatal("manager lost the submitted job snapshot")
+	}
+	if stored.ProwJobAccepted {
+		t.Fatal("manager map aliases the job mutated by newJobWithContext")
+	}
+}
+
+func TestSlackLaunchAmbiguousCreateKeepsReservationWhenProwJobMissing(t *testing.T) {
+	f := newClusterLaunchFixture(2)
+	f.createHook = func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, context.DeadlineExceeded
+	}
+	_, err := f.manager.LaunchJobForUser(slackLaunchTestRequest("U123"))
+	if err == nil || !strings.Contains(err.Error(), "`done`") {
+		t.Fatalf("ambiguous Slack launch error = %v, want a hint to run done", err)
+	}
+	req := f.manager.requests["U123"]
+	if req == nil || req.SubmissionInProgress || f.manager.jobs[req.Name] == nil {
+		t.Fatalf("ambiguous launch did not keep a finalized reservation: requests=%#v jobs=%#v", f.manager.requests, f.manager.jobs)
+	}
+}
+
+func TestSlackLaunchPrepareErrorIsUserVisible(t *testing.T) {
+	f := newClusterLaunchFixture(2)
+	req := slackLaunchTestRequest("U123")
+	req.Platform = "gcp"
+	_, err := f.manager.LaunchJobForUser(req)
+	if err == nil || !strings.Contains(err.Error(), "unable to find prow job") {
+		t.Fatalf("Slack launch error = %v, want the preparation error text", err)
+	}
+	if f.manager.requests["U123"] != nil || len(f.manager.jobs) != 0 || f.createCount.Load() != 0 {
+		t.Fatalf("failed preparation left state: requests=%#v jobs=%#v creates=%d", f.manager.requests, f.manager.jobs, f.createCount.Load())
+	}
+}
+
+func TestSlackLaunchAmbiguousCreateKeepsReservationWhenLookupFails(t *testing.T) {
+	f := newClusterLaunchFixture(2)
+	f.createHook = func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, context.DeadlineExceeded
+	}
+	f.client.PrependReactor("get", "prowjobs", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, errors.New("Prow unavailable")
+	})
+	_, err := f.manager.LaunchJobForUser(slackLaunchTestRequest("U123"))
+	if err == nil || !strings.Contains(err.Error(), "`done`") {
+		t.Fatalf("ambiguous Slack launch error = %v, want a hint to run done", err)
+	}
+	if req := f.manager.requests["U123"]; req == nil || req.SubmissionInProgress {
+		t.Fatalf("ambiguous launch did not keep a finalized reservation: %#v", req)
+	}
+}
+
+func TestSubmitClusterFailedRetryKeepsReservationFromAmbiguousAttempt(t *testing.T) {
+	f := newClusterLaunchFixture(2)
+	f.createHook = func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, context.DeadlineExceeded
+	}
+	first, _ := successfulDMRequest("U123", "request-kept-retry", launchTestImage)
+	if _, err := f.manager.SubmitCluster(context.Background(), first); err == nil {
+		t.Fatal("ambiguous create unexpectedly succeeded")
+	}
+	kept := f.manager.requests["U123"]
+	if kept == nil || kept.SubmissionInProgress || f.manager.jobs[kept.Name] == nil {
+		t.Fatalf("ambiguous create did not keep a finalized reservation: request=%#v jobs=%#v", kept, f.manager.jobs)
+	}
+
+	retry := launchTestRequest("U123", "request-kept-retry", launchTestImage)
+	retry.ResolveDM = func(context.Context) (string, error) { return "", errors.New("Slack unavailable") }
+	_, err := f.manager.SubmitCluster(context.Background(), retry)
+	if toolErr := launchToolError(t, err); toolErr.Code != ToolErrorCodeBackendUnavailable {
+		t.Fatalf("retry error = %#v, want BACKEND_UNAVAILABLE", toolErr)
+	}
+	restored := f.manager.requests["U123"]
+	if restored == nil || restored.Name != kept.Name || restored.SubmissionInProgress || !restored.RequestedAt.Equal(kept.RequestedAt) {
+		t.Fatalf("failed retry did not restore the kept reservation: got %#v, want %#v", restored, kept)
+	}
+	if f.manager.jobs[kept.Name] == nil {
+		t.Fatal("failed retry deleted the kept job")
+	}
+}
+
+func TestRecordAcceptedClusterJobSerializesWithDestroy(t *testing.T) {
+	pj := syncTestProwJob("accepted-during-destroy", "U123", time.Now().UTC())
+	m := newSyncTestManager(t)
+	// Reserve the worker so a mistaken monitor start does not run.
+	m.muJob.running = map[string]struct{}{pj.Name: {}}
+	planned, err := clusterJobFromProwJob(pj, m.maxAge)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := jobRequestFromClusterJob(planned)
+	req.SubmissionInProgress = true
+	m.requests["U123"] = req
+	m.jobs[pj.Name] = cloneJob(planned)
+
+	// Hold the lifecycle lock as DestroyCluster does while it terminates.
+	unlock := m.lifecycleLocks.lock(pj.Name)
+	recorded := make(chan *Job, 1)
+	go func() {
+		_, worker, recordErr := m.recordAcceptedClusterJob(req, planned, pj)
+		if recordErr != nil {
+			t.Errorf("recordAcceptedClusterJob() error = %v", recordErr)
+		}
+		recorded <- worker
+	}()
+	select {
+	case <-recorded:
+		unlock()
+		t.Fatal("recordAcceptedClusterJob() did not wait for the lifecycle lock")
+	case <-time.After(50 * time.Millisecond):
+	}
+	m.lock.Lock()
+	destroyed := cloneJob(m.jobs[pj.Name])
+	markJobTerminationRequested(destroyed)
+	m.jobs[pj.Name] = destroyed
+	delete(m.requests, "U123")
+	m.lock.Unlock()
+	unlock()
+
+	var worker *Job
+	select {
+	case worker = <-recorded:
+	case <-time.After(5 * time.Second):
+		t.Fatal("recordAcceptedClusterJob() did not finish after the lifecycle lock was released")
+	}
+	m.lock.RLock()
+	defer m.lock.RUnlock()
+	if request := m.requests["U123"]; request != nil {
+		t.Fatalf("record after destroy resurrected the reservation: %#v", request)
+	}
+	if job := m.jobs[pj.Name]; job == nil || !job.TerminationRequested {
+		t.Fatalf("record after destroy lost the termination: %#v", job)
+	}
+	if worker == nil || !worker.TerminationRequested {
+		t.Fatalf("recorded worker = %#v, want the destroyed launch", worker)
+	}
+}
+
+func workflowLaunchTestRequest(user string) *JobRequest {
+	req := slackLaunchTestRequest(user)
+	req.Type = JobTypeWorkflowLaunch
+	req.WorkflowName = "test-workflow"
+	req.JobParams = map[string]string{"CUSTOM_ENV": "value"}
+	return req
+}
+
+func newWorkflowLaunchFixture() *clusterLaunchFixture {
+	f := newClusterLaunchFixture(2)
+	f.manager.workflowConfig = &WorkflowConfig{Workflows: map[string]WorkflowConfigItem{"test-workflow": {Platform: "aws"}}}
+	// Slack launches wait for Prow to assign a logs URL.
+	f.createHook = func(action k8stesting.Action) (bool, runtime.Object, error) {
+		pj := action.(k8stesting.CreateAction).GetObject().DeepCopyObject().(*prowapiv1.ProwJob)
+		pj.Status.URL = "https://prow.example/job/" + pj.Name
+		if err := f.client.Tracker().Create(prowJobsResource, pj, "ci"); err != nil {
+			return true, nil, err
+		}
+		return true, pj, nil
+	}
+	return f
+}
+
+func TestWorkflowLaunchRoutesThroughClusterAdmission(t *testing.T) {
+	f := newWorkflowLaunchFixture()
+	if _, err := f.manager.LaunchJobForUser(workflowLaunchTestRequest("U123")); err != nil {
+		t.Fatalf("workflow launch returned error: %v", err)
+	}
+	request := f.manager.requests["U123"]
+	if request == nil || request.Type != JobTypeWorkflowLaunch || request.SubmissionInProgress || request.RequestSource != requestSourceSlack {
+		t.Fatalf("workflow launch reservation = %#v", request)
+	}
+	pj, err := f.client.ProwV1().ProwJobs("ci").Get(context.Background(), request.Name, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("could not read workflow ProwJob: %v", err)
+	}
+	if pj.Annotations["ci-chat-bot.openshift.io/mode"] != JobTypeWorkflowLaunch {
+		t.Fatalf("mode annotation = %q, want %q", pj.Annotations["ci-chat-bot.openshift.io/mode"], JobTypeWorkflowLaunch)
+	}
+	if job := f.manager.jobs[request.Name]; job == nil || job.Mode != JobTypeWorkflowLaunch {
+		t.Fatalf("workflow launch job = %#v", job)
+	}
+
+	// The shared admission gate rejects a second launch from the same user.
+	if _, err := f.manager.LaunchJobForUser(slackLaunchTestRequest("U123")); err == nil || !strings.Contains(err.Error(), "already requested a cluster") {
+		t.Fatalf("second launch error = %v, want the active-cluster rejection", err)
+	}
+	if f.createCount.Load() != 1 {
+		t.Fatalf("Prow creates = %d, want 1", f.createCount.Load())
+	}
+}
+
+func TestWorkflowLaunchRejectedBeforeRecovery(t *testing.T) {
+	f := newWorkflowLaunchFixture()
+	f.manager.launchReady = false
+	if _, err := f.manager.LaunchJobForUser(workflowLaunchTestRequest("U123")); err == nil || !strings.Contains(err.Error(), "recovery") {
+		t.Fatalf("workflow launch error = %v, want a recovery-in-progress error", err)
+	}
+	if f.createCount.Load() != 0 || f.manager.requests["U123"] != nil {
+		t.Fatalf("workflow launch before recovery made creates=%d request=%#v", f.createCount.Load(), f.manager.requests["U123"])
+	}
+}
+
+func TestWorkflowLaunchParamsAreNotNameValidated(t *testing.T) {
+	req := workflowLaunchTestRequest("U123")
+	req.JobParams = map[string]string{"CUSTOM_ENV": "value", "test": "e2e"}
+	if err := normalizeJobRequestOptions(req); err != nil {
+		t.Fatalf("normalizeJobRequestOptions() rejected workflow parameters: %v", err)
+	}
+	if req.JobParams["CUSTOM_ENV"] != "value" || req.JobParams["test"] != "e2e" {
+		t.Fatalf("workflow parameters = %#v, want them unchanged", req.JobParams)
+	}
+
+	ordinary := slackLaunchTestRequest("U123")
+	ordinary.JobParams = map[string]string{"CUSTOM_ENV": "value"}
+	if err := normalizeJobRequestOptions(ordinary); err == nil {
+		t.Fatal("normalizeJobRequestOptions() accepted an unknown parameter for an ordinary launch")
+	}
+}
+
+func TestNormalizeJobRequestOptionsAllowsWorkflowPlatformOutsideSupportedPlatforms(t *testing.T) {
+	req := &JobRequest{
+		Inputs:       [][]string{{launchTestImage}},
+		Type:         JobTypeWorkflowLaunch,
+		Platform:     "metal-qe",
+		Architecture: "amd64",
+		RequestedAt:  time.Now(),
+	}
+	if err := normalizeJobRequestOptions(req); err != nil {
+		t.Fatalf("normalizeJobRequestOptions() rejected a workflow platform: %v", err)
+	}
+	if req.Platform != "metal-qe" || req.Architecture != "amd64" {
+		t.Fatalf("normalized options = (%q, %q), want (metal-qe, amd64)", req.Platform, req.Architecture)
+	}
+
+	ordinary := &JobRequest{
+		Inputs:       [][]string{{launchTestImage}},
+		Type:         JobTypeInstall,
+		Platform:     "metal-qe",
+		Architecture: "amd64",
+		RequestedAt:  time.Now(),
+	}
+	if err := normalizeJobRequestOptions(ordinary); err == nil || !strings.Contains(err.Error(), "unknown platform") {
+		t.Fatalf("ordinary launch accepted a workflow platform: %v", err)
+	}
+}
+
+func TestSubmitClusterPersistsTerminationForRecoveredPhantomLaunch(t *testing.T) {
+	f := newClusterLaunchFixture(2)
+	req, dmCalls := successfulDMRequest("U123", "request-phantom-replay", launchTestImage)
+	seeded := addDurableLaunch(f, req, prowapiv1.PendingState, time.Now().Add(-time.Minute))
+
+	phantom, err := clusterJobFromProwJob(seeded, f.manager.maxAge)
+	if err != nil {
+		t.Fatal(err)
+	}
+	markJobTerminationRequested(phantom)
+	f.manager.jobs[seeded.Name] = phantom
+
+	result, err := f.manager.SubmitCluster(context.Background(), req)
+	if err != nil {
+		t.Fatalf("SubmitCluster replay returned error: %v", err)
+	}
+	if !result.Replayed || result.Cluster.JobID != seeded.Name {
+		t.Fatalf("replay result = %#v, want the recovered launch %q", result, seeded.Name)
+	}
+	updated, err := f.client.ProwV1().ProwJobs("ci").Get(context.Background(), seeded.Name, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("could not read recovered ProwJob: %v", err)
+	}
+	if updated.Annotations[annotationTerminationRequested] != terminationMarkerValue {
+		t.Fatalf("recovered ProwJob was not marked for termination: %#v", updated.Annotations)
+	}
+	if dmCalls.Load() != 0 || f.createCount.Load() != 0 {
+		t.Fatalf("replay made DM=%d Prow creates=%d; want neither", dmCalls.Load(), f.createCount.Load())
+	}
+}
+
+func TestTerminateWorkflowLaunchMarksProwJob(t *testing.T) {
+	f := newWorkflowLaunchFixture()
+	if _, err := f.manager.LaunchJobForUser(workflowLaunchTestRequest("U123")); err != nil {
+		t.Fatalf("workflow launch returned error: %v", err)
+	}
+	name := f.manager.requests["U123"].Name
+	message, err := f.manager.TerminateJobForUser("U123")
+	if err != nil || !strings.Contains(message, "flagged for shutdown") {
+		t.Fatalf("TerminateJobForUser() = (%q, %v)", message, err)
+	}
+	pj, err := f.client.ProwV1().ProwJobs("ci").Get(context.Background(), name, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("could not read workflow ProwJob: %v", err)
+	}
+	if pj.Annotations[annotationTerminationRequested] != terminationMarkerValue {
+		t.Fatalf("workflow ProwJob was not marked for termination: %#v", pj.Annotations)
+	}
+	if f.manager.requests["U123"] != nil {
+		t.Fatalf("workflow reservation was not released: %#v", f.manager.requests["U123"])
+	}
+	if job := f.manager.jobs[name]; job == nil || !job.TerminationRequested {
+		t.Fatalf("workflow job was not marked for termination: %#v", job)
+	}
+
+	// MCP destroy stays limited to ordinary launches.
+	if _, err := f.manager.DestroyCluster(context.Background(), "U123", name); !isToolErrorCode(err, ToolErrorCodeNotFound) {
+		t.Fatalf("DestroyCluster() on a workflow launch error = %v, want NOT_FOUND", err)
+	}
+}

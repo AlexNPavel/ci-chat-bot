@@ -4,6 +4,7 @@ package metrics
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 )
@@ -15,6 +16,10 @@ const (
 	UserCommandActivityMetricName = "ci_chat_bot_user_command_activity_total"
 	// GCPAccessRequestsMetricName is the counter for known GCP access outcomes.
 	GCPAccessRequestsMetricName = "ci_chat_bot_gcp_access_requests_total"
+	// MCPOperationsMetricName counts MCP tool outcomes by bounded tool and outcome.
+	MCPOperationsMetricName = "ci_chat_bot_mcp_tool_operations_total"
+	// MCPDurationMetricName measures MCP tool latency by bounded tool and outcome.
+	MCPDurationMetricName = "ci_chat_bot_mcp_tool_duration_seconds"
 )
 
 const (
@@ -50,6 +55,11 @@ type GCPAccessOutcomeRecorder interface {
 	RecordGCPAccessOutcome(slackUserID, membership, outcome string)
 }
 
+// MCPRecorder records MCP tool outcomes without adding user-controlled labels.
+type MCPRecorder interface {
+	RecordMCPOperation(tool, outcome string, duration time.Duration)
+}
+
 // NoopRecorder is a recorder for tests and contexts where metrics are not
 // required.
 type NoopRecorder struct{}
@@ -58,12 +68,19 @@ func (NoopRecorder) RecordCommand(string, string, string) {}
 
 func (NoopRecorder) RecordGCPAccessOutcome(string, string, string) {}
 
+// NoopMCPRecorder is used when MCP metrics are not configured.
+type NoopMCPRecorder struct{}
+
+func (NoopMCPRecorder) RecordMCPOperation(string, string, time.Duration) {}
+
 // Metrics contains the command usage collectors. It is safe for concurrent
 // use by Slack event handlers.
 type Metrics struct {
 	commandExecutions   *prometheus.CounterVec
 	userCommandActivity *prometheus.CounterVec
 	gcpAccessRequests   *prometheus.CounterVec
+	mcpOperations       *prometheus.CounterVec
+	mcpDuration         *prometheus.HistogramVec
 }
 
 // New constructs and registers the ci-chat-bot usage collectors with
@@ -106,10 +123,35 @@ func New(registerer prometheus.Registerer) (*Metrics, error) {
 		return nil, fmt.Errorf("register %s: %w", GCPAccessRequestsMetricName, err)
 	}
 
+	mcpOperations, err := registerCounterVec(registerer, prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: MCPOperationsMetricName,
+			Help: "Total number of MCP tool calls by bounded tool and outcome.",
+		},
+		[]string{"tool", "outcome"},
+	))
+	if err != nil {
+		return nil, fmt.Errorf("register %s: %w", MCPOperationsMetricName, err)
+	}
+
+	mcpDuration, err := registerHistogramVec(registerer, prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    MCPDurationMetricName,
+			Help:    "Duration of MCP tool calls in seconds by bounded tool and outcome.",
+			Buckets: []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120},
+		},
+		[]string{"tool", "outcome"},
+	))
+	if err != nil {
+		return nil, fmt.Errorf("register %s: %w", MCPDurationMetricName, err)
+	}
+
 	return &Metrics{
 		commandExecutions:   commandExecutions,
 		userCommandActivity: userCommandActivity,
 		gcpAccessRequests:   gcpAccessRequests,
+		mcpOperations:       mcpOperations,
+		mcpDuration:         mcpDuration,
 	}, nil
 }
 
@@ -137,6 +179,16 @@ func (m *Metrics) RecordGCPAccessOutcome(slackUserID, membership, outcome string
 		return
 	}
 	m.gcpAccessRequests.WithLabelValues(slackUserID, membership, outcome).Inc()
+}
+
+// RecordMCPOperation records one completed tool invocation. Tool and outcome
+// labels are restricted to fixed values to keep cardinality bounded.
+func (m *Metrics) RecordMCPOperation(tool, outcome string, duration time.Duration) {
+	if m == nil || !validMCPTool(tool) || !validMCPOperationOutcome(outcome) {
+		return
+	}
+	m.mcpOperations.WithLabelValues(tool, outcome).Inc()
+	m.mcpDuration.WithLabelValues(tool, outcome).Observe(duration.Seconds())
 }
 
 // NormalizeCommand converts a command definition and message into a bounded
@@ -180,6 +232,21 @@ func registerCounterVec(registerer prometheus.Registerer, collector *prometheus.
 	return collector, nil
 }
 
+func registerHistogramVec(registerer prometheus.Registerer, collector *prometheus.HistogramVec) (*prometheus.HistogramVec, error) {
+	if err := registerer.Register(collector); err != nil {
+		alreadyRegistered, ok := err.(prometheus.AlreadyRegisteredError)
+		if !ok {
+			return nil, err
+		}
+		existing, ok := alreadyRegistered.ExistingCollector.(*prometheus.HistogramVec)
+		if !ok {
+			return nil, fmt.Errorf("existing collector has type %T, want *prometheus.HistogramVec", alreadyRegistered.ExistingCollector)
+		}
+		return existing, nil
+	}
+	return collector, nil
+}
+
 func validMembership(membership string) bool {
 	switch membership {
 	case MembershipMember, MembershipNonMember, MembershipUnknown:
@@ -209,4 +276,17 @@ func validCommand(command string) bool {
 	default:
 		return false
 	}
+}
+
+func validMCPTool(tool string) bool {
+	switch tool {
+	case "launch_cluster", "get_cluster_status", "get_cluster_credentials", "list_clusters", "destroy_cluster":
+		return true
+	default:
+		return false
+	}
+}
+
+func validMCPOperationOutcome(outcome string) bool {
+	return outcome == "success" || outcome == "error"
 }

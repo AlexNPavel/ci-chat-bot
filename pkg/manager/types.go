@@ -277,7 +277,13 @@ type jobManager struct {
 	requests             map[string]*JobRequest
 	jobs                 map[string]*Job
 	started              time.Time
+	launchReady          bool
+	rosaReady            bool
 	recentStartEstimates []time.Duration
+	// startBackgroundLoops replaces runBackgroundLoops in tests.
+	startBackgroundLoops func()
+	// finishedJobRetryDelay overrides the Prow verification retry delay in tests.
+	finishedJobRetryDelay time.Duration
 
 	clusterPrefix string
 	maxClusters   int
@@ -300,6 +306,8 @@ type jobManager struct {
 		lock    sync.Mutex
 		running map[string]struct{}
 	}
+
+	lifecycleLocks keyedMutex
 
 	jobNotifierFn  JobCallbackFunc
 	workflowConfig *WorkflowConfig
@@ -400,8 +408,13 @@ type JobRequest struct {
 	JobName   string
 	JobParams map[string]string
 
-	Architecture       string
-	ManagedClusterName string
+	Architecture         string
+	ManagedClusterName   string
+	RequestKeyHash       string
+	InputFingerprint     string
+	RawInputFingerprint  string
+	RequestSource        string
+	SubmissionInProgress bool
 }
 
 type JobType string
@@ -490,11 +503,25 @@ type Job struct {
 
 	Credentials        string
 	CredentialsSnippet string
-	Failure            string
+	// Structured access details are populated by the existing launch monitor.
+	// Credentials remains the kubeconfig used by legacy Slack auth responses.
+	ConsoleURL           string
+	APIURL               string
+	ConsoleUsername      string
+	ConsolePassword      string
+	AccessInstructions   string
+	CompletedAt          *time.Time
+	TerminationRequested bool
+	Failure              string
+	// ProwJobAccepted is true only after Prow durably recorded this launch
+	// (Create succeeded or the job was reconstructed from Prow).
+	ProwJobAccepted bool
 
 	RequestedBy      string
 	RequesterUserID  string
 	RequestedChannel string
+	// NotificationSent tracks local delivery independently of synced annotations.
+	NotificationSent bool
 
 	RequestedAt   time.Time
 	ExpiresAt     time.Time
@@ -515,7 +542,11 @@ type Job struct {
 	CatalogComplete bool
 	CatalogError    bool
 
-	ManagedClusterName string
+	ManagedClusterName  string
+	RequestKeyHash      string
+	InputFingerprint    string
+	RawInputFingerprint string
+	RequestSource       string
 }
 
 type OperatorInfo struct {

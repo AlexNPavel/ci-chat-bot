@@ -32,7 +32,6 @@ import (
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
-	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/wait"
 
@@ -309,20 +308,87 @@ func (m *jobManager) updateRosaVersions() error {
 	return nil
 }
 
+// launchRecoveryBackoff paces startup recovery retries: 10s, growing to 2m.
+var launchRecoveryBackoff = wait.Backoff{Duration: 10 * time.Second, Factor: 2, Jitter: 0.1, Steps: 10, Cap: 2 * time.Minute}
+
+// Start begins background work and returns immediately. Launch admission
+// stays closed until recoverLaunches has rebuilt the Prow inventory; ROSA
+// launches additionally wait for the first successful ROSA sync. All other
+// commands are available at once.
 func (m *jobManager) Start() error {
+	m.lock.Lock()
 	m.started = time.Now()
-	go wait.Forever(func() {
-		if err := m.sync(); err != nil {
-			klog.Infof("error during sync: %v", err)
-			return
+	m.launchReady = false
+	m.rosaReady = false
+	m.lock.Unlock()
+
+	go m.recoverLaunches(launchRecoveryBackoff, m.startSyncLoops)
+	go m.runRosaSyncLoop()
+	if m.startBackgroundLoops != nil {
+		m.startBackgroundLoops()
+	} else {
+		m.runBackgroundLoops()
+	}
+	return nil
+}
+
+// recoverLaunches retries the initial Prow sync until it succeeds, then opens
+// launch admission and calls afterRecovery. ROSA recovery runs separately in
+// runRosaSyncLoop so an OCM outage does not block Prow launches.
+func (m *jobManager) recoverLaunches(backoff wait.Backoff, afterRecovery func()) {
+	for {
+		err := m.sync()
+		if err == nil {
+			break
 		}
-	}, time.Minute*5)
-	go wait.Forever(func() {
+		delay := backoff.Step()
+		klog.Warningf("Cluster launch recovery failed, launches stay disabled; retrying in %s: %v", delay.Round(time.Second), err)
+		time.Sleep(delay)
+	}
+	m.lock.Lock()
+	m.launchReady = true
+	m.lock.Unlock()
+	klog.Infof("Cluster launch recovery complete; launches are enabled")
+	if afterRecovery != nil {
+		afterRecovery()
+	}
+}
+
+// runRosaSyncLoop syncs ROSA clusters every minute, starting immediately.
+// ROSA launches are admitted after the first successful sync.
+func (m *jobManager) runRosaSyncLoop() {
+	wait.Forever(func() {
 		if err := m.rosaSync(); err != nil {
 			klog.Infof("error during rosa sync: %v", err)
 			return
 		}
+		m.lock.Lock()
+		if !m.rosaReady {
+			klog.Infof("ROSA cluster recovery complete; ROSA launches are enabled")
+		}
+		m.rosaReady = true
+		m.lock.Unlock()
 	}, time.Minute)
+}
+
+// startSyncLoops starts the periodic Prow sync once recovery has run it. The
+// first periodic run waits one interval, so sync side effects such as MCE
+// imageset creation never run twice back to back.
+func (m *jobManager) startSyncLoops() {
+	go func() {
+		time.Sleep(5 * time.Minute)
+		wait.Forever(func() {
+			if err := m.sync(); err != nil {
+				klog.Infof("error during sync: %v", err)
+				return
+			}
+		}, time.Minute*5)
+	}()
+}
+
+// runBackgroundLoops starts the periodic jobs that do not depend on launch
+// recovery.
+func (m *jobManager) runBackgroundLoops() {
 	go wait.Forever(func() {
 		if err := m.mceSync(); err != nil {
 			klog.Infof("error during mce sync: %v", err)
@@ -349,7 +415,6 @@ func (m *jobManager) Start() error {
 			klog.Warningf("error during gcpAccessCleanup: %v", err)
 		}
 	}, time.Hour)
-	return nil
 }
 
 func paramsToString(params map[string]string) string {
@@ -696,7 +761,7 @@ func (m *jobManager) rosaSync() error {
 		// do not proceed with an empty cluster list: it would wipe the cached
 		// clusters, forget reported errors, and make the secret cleanup below
 		// delete the AWS resources of live clusters
-		return fmt.Errorf("failed to get rosa clusters: %v", err)
+		return fmt.Errorf("failed to get rosa clusters: %w", err)
 	}
 	klog.Infof("Found %d rosa clusters", len(clusterList))
 	rosaClustersMetric.Set(float64(len(clusterList)))
@@ -832,11 +897,12 @@ func (m *jobManager) rosaSync() error {
 	m.rosaClusters.lock.RLock()
 
 	var deletedEntries []string
-	var awsCleanupErrors []error
 	for _, id := range toDelete {
 		if err := m.removeAssociatedAWSResources(id); err != nil {
-			// removeAssociatedAWSResources records error metrics itself
-			awsCleanupErrors = append(awsCleanupErrors, err)
+			// removeAssociatedAWSResources records error metrics itself. The
+			// inventory is already rebuilt, so the entry is retried on the next
+			// sync instead of failing recovery.
+			klog.Errorf("Failed to remove AWS resources for stale ROSA cluster %s: %v", id, err)
 		} else {
 			deletedEntries = append(deletedEntries, id)
 		}
@@ -854,271 +920,6 @@ func (m *jobManager) rosaSync() error {
 			return fmt.Errorf("failed to update `%s` secret to remove stale clusters from list: %w", RosaClusterSecretName, err)
 		}
 	}
-
-	return utilerrors.NewAggregate(awsCleanupErrors)
-}
-
-func (m *jobManager) sync() error {
-	prowjobs, err := m.prowLister.ProwJobs(m.prowNamespace).List(labels.SelectorFromSet(labels.Set{
-		utils.LaunchLabel: "true",
-	}))
-	if err != nil {
-		return err
-	}
-
-	m.lock.Lock()
-	defer m.lock.Unlock()
-
-	now := time.Now()
-
-	for _, job := range prowjobs {
-		previous := m.jobs[job.Name]
-
-		value := job.Annotations["ci-chat-bot.openshift.io/jobInputs"]
-		var inputs []JobInput
-		if len(value) > 0 {
-			if err := json.Unmarshal([]byte(value), &inputs); err != nil {
-				klog.Warningf("Could not deserialize job input annotation from build %s: %v", job.Name, err)
-			}
-		}
-		if len(inputs) == 0 {
-			klog.Infof("No job inputs for %s", job.Name)
-			continue
-		}
-		architecture := job.Annotations["release.openshift.io/architecture"]
-		if len(architecture) == 0 {
-			architecture = "amd64"
-		}
-		buildCluster := job.Annotations["release.openshift.io/buildCluster"]
-		if len(buildCluster) == 0 {
-			buildCluster, err = m.schedule(job)
-			if err != nil {
-				klog.Error(err.Error())
-				buildCluster = job.Spec.Cluster
-			}
-		}
-		var isOperator bool
-		if job.Annotations["ci-chat-bot.openshift.io/IsOperator"] == "true" {
-			isOperator = true
-		}
-		var hasIndex bool
-		if job.Annotations["ci-chat-bot.openshift.io/HasIndex"] == "true" {
-			hasIndex = true
-		}
-		j := &Job{
-			Name:             job.Name,
-			State:            job.Status.State,
-			URL:              job.Status.URL,
-			OriginalMessage:  job.Annotations["ci-chat-bot.openshift.io/originalMessage"],
-			Mode:             job.Annotations["ci-chat-bot.openshift.io/mode"],
-			JobName:          job.Spec.Job,
-			Platform:         job.Annotations["ci-chat-bot.openshift.io/platform"],
-			Inputs:           inputs,
-			RequestedBy:      job.Annotations["ci-chat-bot.openshift.io/user"],
-			RequestedChannel: job.Annotations["ci-chat-bot.openshift.io/channel"],
-			RequestedAt:      job.CreationTimestamp.Time,
-			RequesterUserID:  job.Annotations["ci-chat-bot.openshift.io/requesterUserID"],
-			Architecture:     architecture,
-			BuildCluster:     buildCluster,
-			Operator: OperatorInfo{
-				Is:         isOperator,
-				HasIndex:   hasIndex,
-				BundleName: job.Annotations["ci-chat-bot.openshift.io/OperatorBundleName"],
-			},
-			ManagedClusterName: job.Annotations["ci-chat-bot.openshift.io/managedClusterName"],
-		}
-
-		var err error
-		j.JobParams, err = utils.ParamsFromAnnotation(job.Annotations["ci-chat-bot.openshift.io/jobParams"])
-		if err != nil {
-			klog.Infof("Unable to unmarshal parameters from %s: %v", job.Name, err)
-			continue
-		}
-
-		if expirationString := job.Annotations["ci-chat-bot.openshift.io/expires"]; len(expirationString) > 0 {
-			if maxSeconds, err := strconv.Atoi(expirationString); err == nil && maxSeconds > 0 {
-				j.ExpiresAt = job.CreationTimestamp.Add(time.Duration(maxSeconds) * time.Second)
-			}
-		}
-		if j.ExpiresAt.IsZero() {
-			j.ExpiresAt = job.CreationTimestamp.Add(m.maxAge)
-		}
-		if job.Status.CompletionTime != nil {
-			j.Complete = true
-			j.ExpiresAt = job.Status.CompletionTime.Add(15 * time.Minute)
-		}
-		if j.ExpiresAt.Before(now) {
-			continue
-		}
-
-		switch job.Status.State {
-		case prowapiv1.FailureState:
-			j.Failure = "job failed, see logs"
-
-			m.jobs[job.Name] = j
-			if previous == nil || previous.State != j.State {
-				go m.finishedJob(*j)
-			}
-			m.mceClusters.lock.RLock()
-			if mCluster, ok := m.mceClusters.clusters[j.ManagedClusterName]; ok {
-				metrics.RecordError(errorMCEImagesetJobRun, m.errorMetric)
-				errMsg := fmt.Sprintf("Failed to generate imageset for managed cluster. See logs for details: %s.", job.Status.URL)
-				if err := m.deleteManagedCluster(mCluster); err != nil {
-					errMsg = fmt.Sprintf("\nAn error also occurred when attempting to delete the previously created resources: %v", err)
-					klog.Errorf("Failed to delete managed cluster %s: %v", j.ManagedClusterName, err)
-				}
-				go m.mceSync() // nolint:errcheck
-				m.notifyMce(mCluster, nil, nil, "", "", errors.New(errMsg))
-				m.mceClusters.lock.RUnlock()
-				break
-			}
-			m.mceClusters.lock.RUnlock()
-		case prowapiv1.SuccessState:
-			j.Failure = ""
-
-			m.jobs[job.Name] = j
-			if (previous == nil || previous.State != j.State) && j.ManagedClusterName == "" {
-				go m.finishedJob(*j)
-			} else if j.ManagedClusterName != "" {
-				m.mceClusters.lock.RLock()
-				if mCluster, ok := m.mceClusters.clusters[j.ManagedClusterName]; ok {
-					if _, ok := m.mceClusters.deployments[j.ManagedClusterName]; ok {
-						// deployment already exists; ignore
-						m.mceClusters.lock.RUnlock()
-						break
-					}
-					ciOpNamespace, ok := job.Annotations["ci-chat-bot.openshift.io/ns"]
-					if !ok {
-						// this shouldn't happen
-						msg := fmt.Sprintf("Could not identify ci-operator namespace for job %s.", job.Name)
-						klog.Error(msg)
-						if err := m.deleteManagedCluster(mCluster); err != nil {
-							msg += fmt.Sprintf("\nAn error also occurred when attempting to delete the previously created resources: %v", err)
-							klog.Errorf("Failed to delete managed cluster %s: %v", j.ManagedClusterName, err)
-						}
-						go m.mceSync() // nolint:errcheck
-						m.notifyMce(mCluster, nil, nil, "", "", errors.New(msg))
-						m.mceClusters.lock.RUnlock()
-						break
-					}
-					registryURL := fmt.Sprintf("registry.%s.ci.openshift.org/%s/release:latest", j.BuildCluster, ciOpNamespace)
-					if err := m.createCustomImageset(registryURL, j.ManagedClusterName); err != nil {
-						metrics.RecordError(errorMCEImagesetCreateRef, m.errorMetric)
-						msg := fmt.Sprintf("Failed to create imageset for release created by ci-operator: %v.", err)
-						klog.Errorf("Failed to create cluster imageset: %v", err)
-						if err := m.deleteManagedCluster(mCluster); err != nil {
-							msg += fmt.Sprintf("\nAn error also occurred when attempting to delete the previously created resources: %v", err)
-							klog.Errorf("Failed to delete managed cluster %s: %v", j.ManagedClusterName, err)
-						}
-						go m.mceSync() // nolint:errcheck
-						m.notifyMce(mCluster, nil, nil, "", "", errors.New(msg))
-						m.mceClusters.lock.RUnlock()
-						break
-					}
-					klog.Infof("Created imageset %s pointing to %s", j.ManagedClusterName, registryURL)
-					platform := ""
-					switch mCluster.Labels["Cloud"] {
-					case "Amazon":
-						platform = "aws"
-					case "Google":
-						platform = "gcp"
-					}
-					if err := m.createClusterDeployment(j.ManagedClusterName, j.ManagedClusterName, mCluster.Annotations[utils.BaseDomain], platform); err != nil {
-						msg := fmt.Sprintf("Failed to create Cluster Deployment: %v", err)
-						klog.Errorf("Failed to create cluster deployment: %v", err)
-						if err := m.deleteManagedCluster(mCluster); err != nil {
-							msg += fmt.Sprintf("\nAn error also occurred when attempting to delete the previously created resources: %v", err)
-							klog.Errorf("Failed to delete managed cluster %s: %v", j.ManagedClusterName, err)
-						}
-						go m.mceSync() // nolint:errcheck
-						m.notifyMce(mCluster, nil, nil, "", "", errors.New(msg))
-						m.mceClusters.lock.RUnlock()
-						break
-					}
-					klog.Infof("Created cluster deployment %s", j.ManagedClusterName)
-				}
-				m.mceClusters.lock.RUnlock()
-			}
-
-		case prowapiv1.SchedulingState, prowapiv1.TriggeredState, prowapiv1.PendingState, "":
-			j.State = prowapiv1.PendingState
-			j.Failure = ""
-
-			if j.Mode == JobTypeLaunch || j.Mode == JobTypeWorkflowLaunch {
-				if user := j.RequestedBy; len(user) > 0 {
-					// Check if the user has an existing request.  If they do, then move on
-					if _, ok := m.requests[user]; !ok {
-						// If not, then most likely, the clusterbot has recently (re)started, and we need to populate the
-						// request to ensure that the user can't start a second cluster (instead of waiting for the second
-						// invocation of the sync loop to populate it accordingly).
-						// The 2 scenarios where we need to handle populating the request entry are:
-						//  * A new request (i.e. there is no "previous" job for this user)
-						//  OR
-						//  * A previous job does exist, but it hasn't reached the "Complete" state yet
-						if previous == nil || !previous.Complete {
-							var inputStrings [][]string
-							for _, input := range inputs {
-								var current []string
-								switch {
-								case len(input.Version) > 0:
-									current = append(current, input.Version)
-								case len(input.Image) > 0:
-									current = append(current, input.Image)
-								}
-								for _, ref := range input.Refs {
-									for _, pull := range ref.Pulls {
-										current = append(current, fmt.Sprintf("%s/%s#%d", ref.Org, ref.Repo, pull.Number))
-									}
-								}
-								if len(current) > 0 {
-									inputStrings = append(inputStrings, current)
-								}
-							}
-							params, err := utils.ParamsFromAnnotation(job.Annotations["ci-chat-bot.openshift.io/jobParams"])
-							if err != nil {
-								klog.Infof("Unable to unmarshal parameters from %s: %v", job.Name, err)
-								continue
-							}
-
-							m.requests[user] = &JobRequest{
-								OriginalMessage: job.Annotations["ci-chat-bot.openshift.io/originalMessage"],
-
-								User:         user,
-								Name:         job.Name,
-								JobName:      job.Spec.Job,
-								Platform:     job.Annotations["ci-chat-bot.openshift.io/platform"],
-								JobParams:    params,
-								Inputs:       inputStrings,
-								RequestedAt:  job.CreationTimestamp.Time,
-								Channel:      job.Annotations["ci-chat-bot.openshift.io/channel"],
-								Architecture: architecture,
-							}
-						}
-					}
-				}
-			}
-
-			m.jobs[job.Name] = j
-			if previous == nil || previous.State != j.State || !previous.IsComplete() {
-				go m.handleJobStartup(*j, "sync")
-			}
-		}
-	}
-
-	// forget everything that is too old
-	for _, job := range m.jobs {
-		if job.ExpiresAt.Before(now) {
-			klog.Infof("job %q is expired", job.Name)
-			delete(m.jobs, job.Name)
-		}
-	}
-	for _, req := range m.requests {
-		if req.RequestedAt.Add(m.maxAge * 2).Before(now) {
-			klog.Infof("request %q is expired", req.User)
-			delete(m.requests, req.User)
-		}
-	}
-	klog.Infof("Job sync complete, %d jobs and %d requests", len(m.jobs), len(m.requests))
 
 	return nil
 }
@@ -1267,7 +1068,7 @@ func (m *jobManager) GetUserCluster(user string) *Job {
 
 	for _, job := range m.jobs {
 		if user == job.RequestedBy && (job.Mode == JobTypeLaunch || job.Mode == JobTypeWorkflowLaunch) && (job.State != prowapiv1.SuccessState && !job.Complete) {
-			return job
+			return cloneJob(job)
 		}
 	}
 	return nil
@@ -1482,10 +1283,7 @@ func (m *jobManager) GetLaunchJob(user string) (*Job, error) {
 	if !ok {
 		return nil, fmt.Errorf("your cluster has expired and credentials are no longer available")
 	}
-	copied := *job
-	copied.Inputs = make([]JobInput, len(job.Inputs))
-	copy(copied.Inputs, job.Inputs)
-	return &copied, nil
+	return cloneJob(job), nil
 }
 
 func versionForRefs(refs *prowapiv1.Refs) string {
@@ -1521,6 +1319,13 @@ func pullSpecForTagRef(tag *imagev1.TagReference, namespace, isName string) stri
 
 // ResolveImageOrVersion returns installSpec, tag name or version, runSpec, and error
 func (m *jobManager) ResolveImageOrVersion(imageOrVersion, defaultImageOrVersion, architecture string) (string, string, string, error) {
+	return m.resolveImageOrVersion(context.Background(), imageOrVersion, defaultImageOrVersion, architecture)
+}
+
+func (m *jobManager) resolveImageOrVersion(ctx context.Context, imageOrVersion, defaultImageOrVersion, architecture string) (string, string, string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", "", "", err
+	}
 	if len(strings.TrimSpace(imageOrVersion)) == 0 {
 		if len(defaultImageOrVersion) == 0 {
 			return "", "", "", nil
@@ -1583,14 +1388,17 @@ func (m *jobManager) ResolveImageOrVersion(imageOrVersion, defaultImageOrVersion
 		ns := nsAndStream.Namespace
 		isName := nsAndStream.Imagestream
 		archSuffix := nsAndStream.ArchSuffix
-		is, err := m.imageClient.ImageV1().ImageStreams(ns).Get(context.TODO(), isName, metav1.GetOptions{})
+		is, err := m.imageClient.ImageV1().ImageStreams(ns).Get(ctx, isName, metav1.GetOptions{})
 		if err != nil {
+			if ctx.Err() != nil {
+				return "", "", "", ctx.Err()
+			}
 			continue
 		}
 
 		var amd64IS *imagev1.ImageStream
 		if architecture != "amd64" && architecture != "multi" {
-			amd64IS, err = m.imageClient.ImageV1().ImageStreams("ocp").Get(context.TODO(), strings.TrimSuffix(isName, archSuffix), metav1.GetOptions{})
+			amd64IS, err = m.imageClient.ImageV1().ImageStreams("ocp").Get(ctx, strings.TrimSuffix(isName, archSuffix), metav1.GetOptions{})
 			if err != nil {
 				return "", "", "", fmt.Errorf("failed to get ocp release imagstream: %w", err)
 			}
@@ -1871,11 +1679,18 @@ func (m *jobManager) LookupInputs(inputs []string, architecture string) (string,
 }
 
 func (m *jobManager) lookupInputs(inputs [][]string, architecture string) ([]JobInput, string, error) {
+	return m.lookupInputsWithContext(context.Background(), inputs, architecture)
+}
+
+func (m *jobManager) lookupInputsWithContext(ctx context.Context, inputs [][]string, architecture string) ([]JobInput, string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, "", err
+	}
 	// LookupInputs needs len(inputs) to match len(JobInputs), so we need to return the defaulted version for it
 	defaultedVersion := ""
 	// default lookups to "nightly"
 	if len(inputs) == 0 || (len(inputs) == 1 && len(inputs[0]) == 0) {
-		_, version, _, err := m.ResolveImageOrVersion("nightly", "", architecture)
+		_, version, _, err := m.resolveImageOrVersion(ctx, "nightly", "", architecture)
 		if err != nil {
 			return nil, "", err
 		}
@@ -1885,10 +1700,16 @@ func (m *jobManager) lookupInputs(inputs [][]string, architecture string) ([]Job
 
 	var jobInputs []JobInput
 	for _, input := range inputs {
+		if err := ctx.Err(); err != nil {
+			return nil, defaultedVersion, err
+		}
 		var jobInput JobInput
 		for _, part := range input {
+			if err := ctx.Err(); err != nil {
+				return nil, defaultedVersion, err
+			}
 			// if the user provided a pull spec (org/repo#number) we'll build from that
-			pr, err := m.ResolveAsPullRequest(part)
+			pr, err := m.resolveAsPullRequestWithContext(ctx, part)
 			if err != nil {
 				return nil, defaultedVersion, err
 			}
@@ -1906,7 +1727,7 @@ func (m *jobManager) lookupInputs(inputs [][]string, architecture string) ([]Job
 				}
 			} else {
 				// otherwise, resolve as a semantic version (as a tag on the release image stream) or as an image
-				image, version, runImage, err := m.ResolveImageOrVersion(part, "", architecture)
+				image, version, runImage, err := m.resolveImageOrVersion(ctx, part, "", architecture)
 				if err != nil {
 					return nil, defaultedVersion, err
 				}
@@ -1933,6 +1754,13 @@ func (m *jobManager) lookupInputs(inputs [][]string, architecture string) ([]Job
 }
 
 func (m *jobManager) ResolveAsPullRequest(spec string) (*prowapiv1.Refs, error) {
+	return m.resolveAsPullRequestWithContext(context.Background(), spec)
+}
+
+func (m *jobManager) resolveAsPullRequestWithContext(ctx context.Context, spec string) (*prowapiv1.Refs, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	var parts []string
 	switch {
 	case strings.HasPrefix(spec, "https://github.com/"):
@@ -1960,9 +1788,9 @@ func (m *jobManager) ResolveAsPullRequest(spec string) (*prowapiv1.Refs, error) 
 		return nil, fmt.Errorf("when specifying a pull request, you must provide ORG/REPO#NUMBER")
 	}
 
-	pr, err := m.githubClient.GetPullRequest(url.PathEscape(locationParts[0]), url.PathEscape(locationParts[1]), num)
+	pr, err := getPullRequestWithContext(ctx, m.githubClient, url.PathEscape(locationParts[0]), url.PathEscape(locationParts[1]), num)
 	if err != nil {
-		return nil, fmt.Errorf("unable to lookup pull request %s: %v", spec, err)
+		return nil, fmt.Errorf("unable to lookup pull request %s: %w", spec, err)
 	}
 
 	if pr.Merged {
@@ -1977,9 +1805,11 @@ func (m *jobManager) ResolveAsPullRequest(spec string) (*prowapiv1.Refs, error) 
 		owner = pr.User.Login
 	}
 
-	baseRefSHA, err := m.githubClient.GetRef(url.PathEscape(locationParts[0]), url.PathEscape(locationParts[1]), "heads/"+pr.Base.Ref)
+	// Always build against the current base-branch tip, as the Slack path
+	// always has. The pull request's recorded base commit can be stale.
+	baseRefSHA, err := m.githubClient.GetRefWithContext(ctx, url.PathEscape(locationParts[0]), url.PathEscape(locationParts[1]), "heads/"+pr.Base.Ref)
 	if err != nil {
-		return nil, fmt.Errorf("unable to lookup pull request ref: %v", err)
+		return nil, fmt.Errorf("unable to lookup pull request ref: %w", err)
 	}
 
 	return &prowapiv1.Refs{
@@ -1999,7 +1829,22 @@ func (m *jobManager) ResolveAsPullRequest(spec string) (*prowapiv1.Refs, error) 
 	}, nil
 }
 
+// defaultJobName sets the request time and the time-based job name when the
+// request does not already have them.
+func (m *jobManager) defaultJobName(req *JobRequest) {
+	if req.RequestedAt.IsZero() {
+		req.RequestedAt = time.Now()
+	}
+	if req.Name == "" {
+		req.Name = fmt.Sprintf("%s%s", m.clusterPrefix, req.RequestedAt.UTC().Format("2006-01-02-150405.9999"))
+	}
+}
+
 func (m *jobManager) resolveToJob(req *JobRequest) (*Job, error) {
+	return m.resolveToJobWithContext(context.Background(), req)
+}
+
+func (m *jobManager) resolveToJobWithContext(ctx context.Context, req *JobRequest) (*Job, error) {
 	user := req.User
 	if len(user) == 0 {
 		return nil, fmt.Errorf("must specify the name of the user who requested this cluster")
@@ -2017,9 +1862,8 @@ func (m *jobManager) resolveToJob(req *JobRequest) (*Job, error) {
 		}
 	}
 
-	req.RequestedAt = time.Now()
-	name := fmt.Sprintf("%s%s", m.clusterPrefix, req.RequestedAt.UTC().Format("2006-01-02-150405.9999"))
-	req.Name = name
+	m.defaultJobName(req)
+	name := req.Name
 
 	job := &Job{
 		OriginalMessage: req.OriginalMessage,
@@ -2039,10 +1883,14 @@ func (m *jobManager) resolveToJob(req *JobRequest) (*Job, error) {
 		Architecture: req.Architecture,
 		WorkflowName: req.WorkflowName,
 
-		ManagedClusterName: req.ManagedClusterName,
+		ManagedClusterName:  req.ManagedClusterName,
+		RequestKeyHash:      req.RequestKeyHash,
+		InputFingerprint:    req.InputFingerprint,
+		RawInputFingerprint: req.RawInputFingerprint,
+		RequestSource:       req.RequestSource,
 	}
 
-	jobInputs, _, err := m.lookupInputs(req.Inputs, job.Architecture)
+	jobInputs, _, err := m.lookupInputsWithContext(ctx, req.Inputs, job.Architecture)
 	if err != nil {
 		return nil, err
 	}
@@ -2416,6 +2264,13 @@ func containsValidVersion(listOfImageOrVersionOrPRs []string) bool {
 }
 
 func (m *jobManager) LaunchJobForUser(req *JobRequest) (string, error) {
+	if req != nil && isLaunchRequestType(req.Type) {
+		return m.launchClusterForSlack(req)
+	}
+	return m.launchJobForUserLegacy(req)
+}
+
+func (m *jobManager) launchJobForUserLegacy(req *JobRequest) (string, error) {
 	if cluster, _ := m.getROSAClusterForUser(req.User); cluster != nil {
 		return "", fmt.Errorf("you have already requested a cluster via the `rosa create` command; %d minutes have elapsed", int(time.Since(cluster.CreationTimestamp())/time.Minute))
 	}
@@ -2435,60 +2290,10 @@ func (m *jobManager) LaunchJobForUser(req *JobRequest) (string, error) {
 		return "", err
 	}
 
-	// try to pick a job that matches the install version, if we can, otherwise use the first that
-	// matches us (we can do better)
-	var prowJob *prowapiv1.ProwJob
-	jobType := JobTypeLaunch
-	if req.Type == JobTypeWorkflowUpgrade {
-		jobType = JobTypeUpgrade
+	if err := selectLaunchJob(context.Background(), m, req, job); err != nil {
+		return "", err
 	}
-	selector := labels.Set{"job-env": req.Platform, "job-type": jobType, "job-architecture": req.Architecture} // TODO: handle versioned variants better
-	if len(job.Inputs[0].Version) > 0 {
-		if v, err := semver.ParseTolerant(job.Inputs[0].Version); err == nil {
-			withRelease := labels.Merge(selector, labels.Set{"job-release": fmt.Sprintf("%d.%d", v.Major, v.Minor)})
-			prowJob, _ = prow.JobForLabels(m.prowConfigLoader, labels.SelectorFromSet(withRelease))
-		}
-	}
-
-	if prowJob == nil {
-		architectureLabel := req.Architecture
-		// multiarch image launches use amd64 jobs
-		if architectureLabel == "multi" {
-			architectureLabel = "amd64"
-		}
-		selector := labels.Set{"job-env": req.Platform, "job-type": JobTypeLaunch, "config-type": "modern", "job-architecture": architectureLabel} // these jobs will only contain configs using non-deprecated features
-		prowJob, _ = prow.JobForLabels(m.prowConfigLoader, labels.SelectorFromSet(selector))
-		if prowJob != nil {
-			if sourceEnv, _, ok := firstEnvVar(prowJob.Spec.PodSpec, "UNRESOLVED_CONFIG"); ok { // all multistage configs will be unresolved
-				configHasVariant, _, err := configContainsVariant(req.JobParams, req.Platform, sourceEnv.Value, job.Mode)
-				if err != nil {
-					return "", err
-				}
-				// if the config does not contain the wanted variant, reset prowjob to cause configuration error
-				if !configHasVariant {
-					prowJob = nil
-				}
-			}
-		}
-	}
-	if prowJob == nil {
-		return "", fmt.Errorf("configuration error, unable to find prow job matching %s with parameters=%v", selector, paramsToString(job.JobParams))
-	}
-	job.JobName = prowJob.Spec.Job
-	job.BuildCluster, err = m.schedule(prowJob)
-	if err != nil {
-		klog.Error(err.Error())
-		job.BuildCluster = prowJob.Spec.Cluster
-	}
-
 	klog.Infof("Job %q requested by user %q with mode %s prow job %s(%s) - params=%s, inputs=%#v", job.Name, req.User, job.Mode, job.JobName, job.BuildCluster, paramsToString(job.JobParams), job.Inputs)
-
-	// Delegate account dispersement to Test Platform via the platform's
-	// cluster-profile set, which randomly selects an underlying account at
-	// runtime. Non-amd64 launches keep the default per-platform profile.
-	if req.Architecture == "amd64" {
-		job.CloudProfileSet = platformProfileSets[req.Platform]
-	}
 
 	msg, err := func() (string, error) {
 		m.lock.Lock()
@@ -2553,7 +2358,9 @@ func (m *jobManager) LaunchJobForUser(req *JobRequest) (string, error) {
 				return "", fmt.Errorf("you can't have more than %d running jobs at a time", maxJobsPerUser)
 			}
 		}
-		m.jobs[job.Name] = job
+		// Store a snapshot: newJob mutates the job (ProwJobAccepted), and the
+		// manager map must not alias an object that is written outside m.lock.
+		m.jobs[job.Name] = cloneJob(job)
 		klog.Infof("Job %q starting cluster for %q", job.Name, user)
 		return "", nil
 	}()
@@ -2576,7 +2383,7 @@ func (m *jobManager) LaunchJobForUser(req *JobRequest) (string, error) {
 		return "", fmt.Errorf("the requested job is taking longer than expected to start: %v", err)
 	}
 
-	go m.handleJobStartup(*job, "start")
+	go m.handleJobStartup(*cloneJob(job), "start")
 
 	msg = ""
 	if UseSpotInstances(job) {
@@ -2618,23 +2425,21 @@ func (m *jobManager) LaunchJobForUser(req *JobRequest) (string, error) {
 	return "", fmt.Errorf("%s<%s|job> started, you will be notified on completion", msg, prowJobUrl)
 }
 
-func (m *jobManager) clusterDetailsForUser(user string) (string, string, error) {
+// terminationTargetForUser returns snapshots of the user's current request and
+// its job. The job is nil while no record exists for the request yet.
+func (m *jobManager) terminationTargetForUser(user string) (*JobRequest, *Job, error) {
 	if len(user) == 0 {
-		return "", "", fmt.Errorf("must specify the name of the user who requested this cluster")
+		return nil, nil, fmt.Errorf("must specify the name of the user who requested this cluster")
 	}
 
-	m.lock.Lock()
-	defer m.lock.Unlock()
+	m.lock.RLock()
+	defer m.lock.RUnlock()
 
 	existing, ok := m.requests[user]
 	if !ok || len(existing.Name) == 0 {
-		return "", "", fmt.Errorf("no cluster has been requested by you")
+		return nil, nil, fmt.Errorf("no cluster has been requested by you")
 	}
-	job, ok := m.jobs[existing.Name]
-	if !ok || len(job.BuildCluster) == 0 {
-		return "", "", fmt.Errorf("unable to determine build cluster for your job")
-	}
-	return existing.Name, job.BuildCluster, nil
+	return cloneJobRequest(existing), cloneJob(m.jobs[existing.Name]), nil
 }
 
 func (m *jobManager) TerminateJobForUser(user string) (string, error) {
@@ -2648,12 +2453,29 @@ func (m *jobManager) TerminateJobForUser(user string) (string, error) {
 		}
 	}
 
-	name, cluster, err := m.clusterDetailsForUser(user)
+	request, job, err := m.terminationTargetForUser(user)
 	if err != nil {
 		return "", err
 	}
+	name := request.Name
 
-	if err := m.stopJob(name, cluster); err != nil {
+	// Cluster launches use the durable termination path, which also handles a
+	// launch that is still being submitted and has no build cluster yet.
+	if (job != nil && isClusterLaunchMode(job.Mode)) || (job == nil && isLaunchRequestType(request.Type)) {
+		mode := launchModeForRequest(request.Type)
+		if job != nil {
+			mode = job.Mode
+		}
+		if _, err := m.destroyClusterWithMode(context.Background(), user, name, mode); err != nil {
+			return "", fmt.Errorf("unable to terminate: %v", err)
+		}
+		return "the cluster was flagged for shutdown, you may now launch another", nil
+	}
+	if job == nil || len(job.BuildCluster) == 0 {
+		return "", fmt.Errorf("unable to determine build cluster for your job")
+	}
+
+	if err := m.stopJob(name, job.BuildCluster); err != nil {
 		return "", fmt.Errorf("unable to terminate: %v", err)
 	}
 
@@ -2703,7 +2525,7 @@ func (m *jobManager) SyncJobForUser(user string) (string, error) {
 		msg = "cluster had previously been marked as successful, checking again"
 	}
 
-	copied := *job
+	copied := *cloneJob(job)
 	copied.Failure = ""
 	klog.Infof("user %q requests job %q to be refreshed", user, copied.Name)
 	go m.handleJobStartup(copied, "refresh")
@@ -2718,10 +2540,16 @@ func (m *jobManager) jobIsComplete(job *Job) bool {
 	if !ok {
 		return false
 	}
-	if current.IsComplete() {
+	if current.TerminationRequested || current.IsComplete() {
 		job.State = current.State
 		job.URL = current.URL
 		job.Complete = current.Complete
+		job.TerminationRequested = current.TerminationRequested
+		job.Failure = current.Failure
+		job.ExpiresAt = current.ExpiresAt
+		if current.TerminationRequested || current.Complete || isTerminalProwState(current.State) {
+			clearJobAccess(job)
+		}
 		return true
 	}
 	return false
@@ -2742,6 +2570,9 @@ func (m *jobManager) prowJobIsStillRunning(name string) bool {
 }
 
 func (m *jobManager) handleJobStartup(job Job, source string) {
+	if copied := cloneJob(&job); copied != nil {
+		job = *copied
+	}
 	if !m.tryJob(job.Name) {
 		klog.Infof("Job %q already has a worker (%s)", job.Name, source)
 		return
@@ -2766,9 +2597,66 @@ func (m *jobManager) handleJobStartup(job Job, source string) {
 	m.finishedJob(job)
 }
 
+// finishedJobVerifyAttempts bounds how long a completed launch monitor waits
+// for Prow to confirm its final state before publishing what it observed.
+const finishedJobVerifyAttempts = 12
+
 func (m *jobManager) finishedJob(job Job) {
+	// Keep the completed monitor result until Prow can verify it. Release the
+	// lifecycle lock between attempts so destruction can proceed during outages.
+	// After finishedJobVerifyAttempts failures, publish the monitor result so the
+	// user still receives credentials or the failure.
+	delay := m.finishedJobRetryDelay
+	if delay == 0 {
+		delay = 10 * time.Second
+	}
+	for attempt := 1; !m.tryFinishedJob(job, attempt < finishedJobVerifyAttempts); attempt++ {
+		if m.prowClient == nil || job.Mode != JobTypeLaunch {
+			return
+		}
+		klog.Warningf("Job %q final state verification failed (attempt %d/%d); retaining monitor result for retry", job.Name, attempt, finishedJobVerifyAttempts)
+		time.Sleep(delay)
+	}
+}
+
+// tryFinishedJob returns false when verification must be retried. When
+// requireVerification is false, a failed Prow lookup publishes the monitor
+// result as observed.
+func (m *jobManager) tryFinishedJob(job Job, requireVerification bool) bool {
+	unlock := m.lifecycleLocks.lock(job.Name)
+	defer unlock()
+
+	// Check the durable state immediately before publishing monitor results. A
+	// destroy request can arrive while the monitor is waiting on cluster health.
+	if !m.refreshMonitorJobState(&job) {
+		if requireVerification {
+			return false
+		}
+		klog.Warningf("Job %q final state could not be verified with Prow; publishing monitor result", job.Name)
+	}
+
 	m.lock.Lock()
 	defer m.lock.Unlock()
+	current := m.jobs[job.Name]
+	if current != nil {
+		if current.TerminationRequested {
+			return true
+		}
+		if current.Complete && !job.Complete && !isTerminalProwState(job.State) {
+			return true
+		}
+		if isTerminalProwState(current.State) && !isTerminalProwState(job.State) {
+			return true
+		}
+		if current.NotificationSent {
+			job.RequestedChannel = ""
+			job.NotificationSent = true
+		}
+	}
+	if job.TerminationRequested {
+		clearJobAccess(&job)
+		job.RequestedChannel = ""
+	}
 
 	// track the 10 most recent starts in sorted order
 	if (job.Mode == JobTypeLaunch || job.Mode == JobTypeWorkflowLaunch) && len(job.Credentials) > 0 && job.StartDuration > 0 {
@@ -2782,13 +2670,16 @@ func (m *jobManager) finishedJob(job Job) {
 	if len(job.RequestedChannel) > 0 && len(job.RequestedBy) > 0 {
 		klog.Infof("Job %q complete, notify %q", job.Name, job.RequestedBy)
 		if m.jobNotifierFn != nil {
-			go m.jobNotifierFn(job)
+			notification := cloneJob(&job)
+			go m.jobNotifierFn(*notification)
+			job.NotificationSent = true
 		}
 	}
 
 	// ensure we send no further notifications
 	job.RequestedChannel = ""
-	m.jobs[job.Name] = &job
+	m.jobs[job.Name] = cloneJob(&job)
+	return true
 }
 
 func (m *jobManager) tryJob(name string) bool {
@@ -3097,6 +2988,12 @@ func (m *jobManager) CreateRosaCluster(user, channel, version string, duration t
 	if duration > m.maxRosaAge {
 		return "", fmt.Errorf("max duration for a ROSA cluster is %s", m.maxRosaAge.String())
 	}
+	m.lock.RLock()
+	rosaReady := m.rosaReady
+	m.lock.RUnlock()
+	if !rosaReady {
+		return "", errors.New("ROSA cluster recovery is still in progress; retry shortly")
+	}
 	cluster, _ := m.getROSAClusterForUser(user)
 	if cluster != nil {
 		return "", fmt.Errorf("you have already requested a cluster; %d minutes have elapsed", int(time.Since(cluster.CreationTimestamp())/time.Minute))
@@ -3155,8 +3052,11 @@ func (m *jobManager) LookupRosaInputs(versionPrefix string) (string, error) {
 	}
 }
 
-func (m *jobManager) schedule(pj *prowapiv1.ProwJob) (string, error) {
-	cluster, err := m.prowScheduler.Schedule(context.TODO(), pj)
+func (m *jobManager) scheduleWithContext(ctx context.Context, pj *prowapiv1.ProwJob) (string, error) {
+	if m.prowScheduler == nil {
+		return "", fmt.Errorf("prow scheduler is unavailable")
+	}
+	cluster, err := m.prowScheduler.Schedule(ctx, pj)
 	if err != nil {
 		return "", fmt.Errorf("failed to schedule job %s: %v", pj.Name, err)
 	}

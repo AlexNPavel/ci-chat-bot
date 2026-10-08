@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/base32"
 	"encoding/json"
+	stderrors "errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -229,6 +230,13 @@ func testStepForPlatform(platform string) string {
 }
 
 func (r *URLConfigResolver) Resolve(org, repo, branch, variant string) ([]byte, bool, error) {
+	return r.ResolveWithContext(context.Background(), org, repo, branch, variant)
+}
+
+func (r *URLConfigResolver) ResolveWithContext(ctx context.Context, org, repo, branch, variant string) ([]byte, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, false, err
+	}
 	switch r.URL.Scheme {
 	case "http", "https":
 		u := *r.URL
@@ -245,7 +253,11 @@ func (r *URLConfigResolver) Resolve(org, repo, branch, variant string) ([]byte, 
 			return nil, false, fmt.Errorf("url resolve failed: %v", err)
 		}
 		client := http.Client{Transport: rt}
-		resp, err := client.Get(u.String())
+		request, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+		if err != nil {
+			return nil, false, fmt.Errorf("url resolve failed: %v", err)
+		}
+		resp, err := client.Do(request)
 		if err != nil {
 			return nil, false, fmt.Errorf("url resolve failed: %v", err)
 		}
@@ -318,15 +330,31 @@ func (m *jobManager) stopJob(name, cluster string) error {
 	return err
 }
 
-// newJob creates a ProwJob for running the provided job and exits.
+// newJob creates a ProwJob and waits for its logs URL for the legacy Slack path.
 func (m *jobManager) newJob(job *Job) (string, error) {
+	return m.newJobWithContext(context.Background(), job, true)
+}
+
+// newJobWithContext creates the ProwJob. Structured callers set waitForURL to
+// false so acceptance returns as soon as the durable ProwJob record exists.
+//
+// newJobWithContext records whether Prow accepted the job on job, so callers
+// must pass an unshared copy; jobManager never stores that pointer.
+func (m *jobManager) newJobWithContext(ctx context.Context, job *Job, waitForURL bool) (string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if !m.tryJob(job.Name) {
 		klog.Infof("Job %q already has a worker", job.Name)
+		if !waitForURL {
+			return "", prowJobAcceptedError{err: fmt.Errorf("job %q is already being reconciled", job.Name)}
+		}
 		return "", nil
 	}
 	defer m.finishJob(job.Name)
 
 	if job.IsComplete() && len(job.CredentialsSnippet) > 0 {
+		job.ProwJobAccepted = true
 		return "", nil
 	}
 	namespace := fmt.Sprintf("ci-ln-%s", namespaceSafeHash(job.Name))
@@ -357,6 +385,7 @@ func (m *jobManager) newJob(job *Job) (string, error) {
 			"ci-chat-bot.openshift.io/platform":        job.Platform,
 			"ci-chat-bot.openshift.io/jobInputs":       string(jobInputData),
 			"ci-chat-bot.openshift.io/buildCluster":    job.BuildCluster,
+			"release.openshift.io/buildCluster":        job.BuildCluster,
 			"ci-chat-bot.openshift.io/requesterUserID": job.RequesterUserID,
 
 			"prow.k8s.io/job": pj.Spec.Job,
@@ -372,6 +401,18 @@ func (m *jobManager) newJob(job *Job) (string, error) {
 			"ci-operator.openshift.io/cloud":                 job.Platform,
 			"ci-operator.openshift.io/cloud-cluster-profile": job.Platform,
 		},
+	}
+	if job.RequestKeyHash != "" {
+		pj.Annotations[annotationRequestKeyHash] = job.RequestKeyHash
+	}
+	if job.InputFingerprint != "" {
+		pj.Annotations[annotationInputFingerprint] = job.InputFingerprint
+	}
+	if job.RawInputFingerprint != "" {
+		pj.Annotations[annotationRawInputFingerprint] = job.RawInputFingerprint
+	}
+	if job.RequestSource != "" {
+		pj.Annotations[annotationRequestSource] = job.RequestSource
 	}
 	if job.ManagedClusterName != "" {
 		pj.Annotations["ci-chat-bot.openshift.io/managedClusterName"] = job.ManagedClusterName
@@ -479,9 +520,9 @@ func (m *jobManager) newJob(job *Job) (string, error) {
 		return "", err
 	}
 
-	sourceConfig, srcNamespace, srcName, err := loadJobConfigSpec(clusterClient.CoreClient, sourceEnv, utils.ProwJobNamespace)
+	sourceConfig, srcNamespace, srcName, err := loadJobConfigSpecWithContext(ctx, clusterClient.CoreClient, sourceEnv, utils.ProwJobNamespace)
 	if err != nil {
-		return "", fmt.Errorf("the launch job definition could not be loaded: %v", err)
+		return "", fmt.Errorf("the launch job definition could not be loaded: %w", err)
 	}
 
 	// errors should never occur here as this has already been checked by the calling function
@@ -663,9 +704,9 @@ func (m *jobManager) newJob(job *Job) (string, error) {
 			return "", err
 		}
 
-		is, err := clusterClient.TargetImageClient.ImageV1().ImageStreams("openshift").Get(context.TODO(), "cli", metav1.GetOptions{})
+		is, err := clusterClient.TargetImageClient.ImageV1().ImageStreams("openshift").Get(ctx, "cli", metav1.GetOptions{})
 		if err != nil {
-			return "", fmt.Errorf("unable to lookup registry URL for job")
+			return "", fmt.Errorf("unable to lookup registry URL for job: %w", err)
 		}
 		registryHost, _, _ := strings.Cut(is.Status.PublicDockerImageRepository, "/")
 
@@ -735,9 +776,9 @@ func (m *jobManager) newJob(job *Job) (string, error) {
 		}
 		for i, input := range job.Inputs {
 			for _, ref := range input.Refs {
-				configData, ok, err := m.configResolver.Resolve(ref.Org, ref.Repo, ref.BaseRef, "")
+				configData, ok, err := resolveConfigWithContext(ctx, m.configResolver, ref.Org, ref.Repo, ref.BaseRef, "")
 				if err != nil {
-					return "", fmt.Errorf("could not resolve config for %s/%s/%s: %v", ref.Org, ref.Repo, ref.BaseRef, err)
+					return "", fmt.Errorf("could not resolve config for %s/%s/%s: %w", ref.Org, ref.Repo, ref.BaseRef, err)
 				}
 				if !ok {
 					return "", fmt.Errorf("there is no defined configuration for the organization %s with repo %s and branch %s", ref.Org, ref.Repo, ref.BaseRef)
@@ -958,16 +999,25 @@ func (m *jobManager) newJob(job *Job) (string, error) {
 		klog.Infof("Job %q will create prow job:\n%s", job.Name, string(data))
 	}
 
-	_, err = m.prowClient.ProwJobs(m.prowNamespace).Create(context.TODO(), pj, metav1.CreateOptions{})
+	_, err = m.prowClient.ProwJobs(m.prowNamespace).Create(ctx, pj, metav1.CreateOptions{})
 	if err != nil && !errors.IsAlreadyExists(err) {
-		return "", err
+		return "", prowJobCreateError{err: err}
+	}
+	// A successful Create, or AlreadyExists, means Prow durably recorded this
+	// launch.
+	job.ProwJobAccepted = true
+	if err != nil && !waitForURL {
+		return "", prowJobCreateError{err: err}
+	}
+	if !waitForURL {
+		return "", nil
 	}
 
 	// TODO: Any errors returned after this point need to make sure that they are properly handled by the enclosing logic calling newJob()
 	var prowJobURL string
 	// Wait for ProwJob URL to be assigned
-	err = wait.PollUntilContextTimeout(context.TODO(), 10*time.Second, 5*time.Minute, true, func(ctx context.Context) (bool, error) {
-		latestPJ, err := m.prowClient.ProwJobs(m.prowNamespace).Get(context.TODO(), job.Name, metav1.GetOptions{})
+	err = wait.PollUntilContextTimeout(ctx, 10*time.Second, 5*time.Minute, true, func(ctx context.Context) (bool, error) {
+		latestPJ, err := m.prowClient.ProwJobs(m.prowNamespace).Get(ctx, job.Name, metav1.GetOptions{})
 		if err != nil {
 			return false, err
 		}
@@ -980,9 +1030,9 @@ func (m *jobManager) newJob(job *Job) (string, error) {
 	})
 	if err != nil {
 		if err.Error() == "context deadline exceeded" {
-			return "", fmt.Errorf("timed out waiting for your prowjob %q to be scheduled.  The job should eventually start and the ClusterBot will respond accordingly.  You can monitor the status yourself via the `list` command.  When a \"view logs\" link appears on the line associated with your name, your job has been scheduled and should progress normally.  If not, please reach out for assistance in #forum-ocp-crt.", job.Name) //nolint:staticcheck
+			return "", prowJobAcceptedError{err: fmt.Errorf("timed out waiting for your prowjob %q to be scheduled.  The job should eventually start and the ClusterBot will respond accordingly.  You can monitor the status yourself via the `list` command.  When a \"view logs\" link appears on the line associated with your name, your job has been scheduled and should progress normally.  If not, please reach out for assistance in #forum-ocp-crt.", job.Name)} //nolint:staticcheck
 		}
-		return "", fmt.Errorf("unable to retrieve job url due to an unexpected error, please reach out for assistance in #forum-ocp-crt: %v", err)
+		return "", prowJobAcceptedError{err: fmt.Errorf("unable to retrieve job url due to an unexpected error, please reach out for assistance in #forum-ocp-crt: %v", err)}
 	}
 
 	return prowJobURL, nil
@@ -1434,26 +1484,12 @@ func (m *jobManager) waitForJob(job *Job) error {
 		waitErr = fmt.Errorf("cluster did not become reachable: %v", err)
 	}
 
-	var kubeadminPassword string
-	var operatorDeploymentInfo string
-	if consoleURL, ok := secretDir.Data["console.url"]; ok {
-		job.CredentialsSnippet = string(consoleURL)
-	} else {
-		return fmt.Errorf("unable to retrieve console.url from step secret %s/%s", namespace, targetName)
-	}
-	if password, ok := secretDir.Data["kubeadmin-password"]; ok {
-		kubeadminPassword = strings.ReplaceAll(string(password), "\n", "")
-	}
-	if deployment, ok := secretDir.Data["oo_deployment_details.yaml"]; ok {
-		operatorDeploymentInfo = string(deployment)
-	}
-	if len(kubeadminPassword) > 0 {
-		job.CredentialsSnippet += fmt.Sprintf("\nLog in to the console with user `kubeadmin` and password `%s`", kubeadminPassword)
-		if len(operatorDeploymentInfo) > 0 {
-			job.CredentialsSnippet += fmt.Sprintf("\nThis following is the deployment information for you operator:\n%s", operatorDeploymentInfo)
+	if waitErr == nil {
+		if err := applyAccessDetails(job, kubeconfig, secretDir.Data); err != nil {
+			return fmt.Errorf("unable to retrieve console.url from step secret %s/%s", namespace, targetName)
 		}
 	} else {
-		job.CredentialsSnippet = "\nError: Unable to retrieve kubeadmin password, you must use the kubeconfig file to access the cluster"
+		clearJobAccess(job)
 	}
 
 	created := len(pj.Annotations["ci-chat-bot.openshift.io/expires"]) == 0
@@ -1461,6 +1497,41 @@ func (m *jobManager) waitForJob(job *Job) error {
 	m.clearNotificationAnnotations(job, created, startDuration)
 
 	return waitErr
+}
+
+// applyAccessDetails sets the Slack credential snippet and the structured
+// access fields from the launch secret. The kubeconfig is always kept. If the
+// structured fields cannot be derived, they stay empty and Slack users still
+// receive the kubeconfig and console URL. A missing console URL is an error.
+func applyAccessDetails(job *Job, kubeconfig string, secretData map[string][]byte) error {
+	clearJobAccess(job)
+	job.Credentials = kubeconfig
+
+	consoleURL := strings.TrimSpace(string(secretData["console.url"]))
+	if consoleURL == "" {
+		return stderrors.New("console URL is missing")
+	}
+	job.CredentialsSnippet = consoleURL
+	if kubeadminPassword := strings.TrimSpace(string(secretData["kubeadmin-password"])); len(kubeadminPassword) > 0 {
+		job.CredentialsSnippet += fmt.Sprintf("\nLog in to the console with user `kubeadmin` and password `%s`", kubeadminPassword)
+		if operatorDeploymentInfo := string(secretData["oo_deployment_details.yaml"]); len(operatorDeploymentInfo) > 0 {
+			job.CredentialsSnippet += fmt.Sprintf("\nThis following is the deployment information for you operator:\n%s", operatorDeploymentInfo)
+		}
+	} else {
+		job.CredentialsSnippet = "\nError: Unable to retrieve kubeadmin password, you must use the kubeconfig file to access the cluster"
+	}
+
+	access, err := accessDetailsFromSecret(kubeconfig, secretData, job.Platform)
+	if err != nil {
+		klog.Warningf("Job %q: structured cluster access details are unavailable: %v", job.Name, err)
+		return nil
+	}
+	job.ConsoleURL = access.ConsoleURL
+	job.APIURL = access.APIURL
+	job.ConsoleUsername = access.ConsoleUsername
+	job.ConsolePassword = access.ConsolePassword
+	job.AccessInstructions = access.AccessInstructions
+	return nil
 }
 
 // clearNotificationAnnotations removes the channel notification annotations in case we crash,
@@ -1728,7 +1799,7 @@ func findTargetName(spec *corev1.PodSpec) (string, error) {
 	return "", fmt.Errorf("could not find argument --target=X in prow job pod spec to identify target pod name")
 }
 
-func loadJobConfigSpec(client clientset.Interface, env corev1.EnvVar, namespace string) (*citools.ReleaseBuildConfiguration, string, string, error) {
+func loadJobConfigSpecWithContext(ctx context.Context, client clientset.Interface, env corev1.EnvVar, namespace string) (*citools.ReleaseBuildConfiguration, string, string, error) {
 	if len(env.Value) > 0 {
 		var cfg citools.ReleaseBuildConfiguration
 		if err := yaml.Unmarshal([]byte(env.Value), &cfg); err != nil {
@@ -1743,9 +1814,9 @@ func loadJobConfigSpec(client clientset.Interface, env corev1.EnvVar, namespace 
 		return nil, "", "", fmt.Errorf("only config spec values inline or referenced in config maps may be used")
 	}
 	configMap, keyName := env.ValueFrom.ConfigMapKeyRef.Name, env.ValueFrom.ConfigMapKeyRef.Key
-	cm, err := client.CoreV1().ConfigMaps(namespace).Get(context.TODO(), configMap, metav1.GetOptions{})
+	cm, err := client.CoreV1().ConfigMaps(namespace).Get(ctx, configMap, metav1.GetOptions{})
 	if err != nil {
-		return nil, "", "", fmt.Errorf("unable to identify a ci-operator configuration for the provided refs: %v", err)
+		return nil, "", "", fmt.Errorf("unable to identify a ci-operator configuration for the provided refs: %w", err)
 	}
 	configData, ok := cm.Data[keyName]
 	if !ok {

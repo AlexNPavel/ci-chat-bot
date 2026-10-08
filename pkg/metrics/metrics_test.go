@@ -2,6 +2,7 @@ package metrics
 
 import (
 	"testing"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 )
@@ -111,6 +112,44 @@ func TestMetricsRecordGCPAccessOutcome(t *testing.T) {
 	}
 }
 
+func TestMetricsRecordMCPOperationUsesBoundedLabels(t *testing.T) {
+	registry := prometheus.NewRegistry()
+	usageMetrics, err := New(registry)
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+
+	usageMetrics.RecordMCPOperation("launch_cluster", "success", 125*time.Millisecond)
+	usageMetrics.RecordMCPOperation("launch_cluster", "success", 250*time.Millisecond)
+	usageMetrics.RecordMCPOperation("caller-controlled-tool", "success", time.Second)
+	usageMetrics.RecordMCPOperation("list_clusters", "caller-controlled-outcome", time.Second)
+
+	if got := counterValue(t, registry, MCPOperationsMetricName, map[string]string{
+		"tool":    "launch_cluster",
+		"outcome": "success",
+	}); got != 2 {
+		t.Fatalf("MCP operation counter = %v, want 2", got)
+	}
+	if got := counterValue(t, registry, MCPOperationsMetricName, map[string]string{
+		"tool":    "caller-controlled-tool",
+		"outcome": "success",
+	}); got != 0 {
+		t.Fatalf("unexpected caller-controlled MCP label count = %v", got)
+	}
+	if got := counterValue(t, registry, MCPOperationsMetricName, map[string]string{
+		"tool":    "list_clusters",
+		"outcome": "caller-controlled-outcome",
+	}); got != 0 {
+		t.Fatalf("unexpected caller-controlled MCP outcome count = %v", got)
+	}
+	if got := histogramCount(t, registry, MCPDurationMetricName, map[string]string{
+		"tool":    "launch_cluster",
+		"outcome": "success",
+	}); got != 2 {
+		t.Fatalf("MCP duration observation count = %d, want 2", got)
+	}
+}
+
 func TestNewReusesAlreadyRegisteredCollectors(t *testing.T) {
 	registry := prometheus.NewRegistry()
 	first, err := New(registry)
@@ -149,6 +188,29 @@ func counterValue(t *testing.T, registry *prometheus.Registry, name string, want
 			}
 			if sameLabels(labels, wantLabels) {
 				return metric.GetCounter().GetValue()
+			}
+		}
+	}
+	return 0
+}
+
+func histogramCount(t *testing.T, registry *prometheus.Registry, name string, wantLabels map[string]string) uint64 {
+	t.Helper()
+	families, err := registry.Gather()
+	if err != nil {
+		t.Fatalf("Gather() failed: %v", err)
+	}
+	for _, family := range families {
+		if family.GetName() != name {
+			continue
+		}
+		for _, metric := range family.GetMetric() {
+			labels := make(map[string]string, len(metric.GetLabel()))
+			for _, label := range metric.GetLabel() {
+				labels[label.GetName()] = label.GetValue()
+			}
+			if sameLabels(labels, wantLabels) {
+				return metric.GetHistogram().GetSampleCount()
 			}
 		}
 	}

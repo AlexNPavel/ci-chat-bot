@@ -1,0 +1,775 @@
+package manager
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"maps"
+	"net/url"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/openshift/ci-chat-bot/pkg/utils"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/client-go/tools/clientcmd"
+	"k8s.io/client-go/util/retry"
+	"k8s.io/klog"
+	prowapiv1 "sigs.k8s.io/prow/pkg/apis/prowjobs/v1"
+)
+
+const (
+	clusterStatusProvisioning = "provisioning"
+	clusterStatusReady        = "ready"
+	clusterStatusFailed       = "failed"
+	clusterStatusTerminating  = "terminating"
+	clusterStatusTerminated   = "terminated"
+	clusterStatusExpired      = "expired"
+)
+
+const terminationMarkerValue = "true"
+
+type clusterAccessDetails struct {
+	ConsoleURL         string
+	APIURL             string
+	ConsoleUsername    string
+	ConsolePassword    string
+	AccessInstructions string
+}
+
+// accessDetailsFromSecret turns the existing launch secret and kubeconfig into
+// structured access fields. The kubeconfig parser honors current-context, so
+// APIURL and a metal proxy are taken from the selected cluster configuration.
+func accessDetailsFromSecret(kubeconfig string, secretData map[string][]byte, platform string) (clusterAccessDetails, error) {
+	consoleURL := strings.TrimSpace(string(secretData["console.url"]))
+	if consoleURL == "" {
+		return clusterAccessDetails{}, fmt.Errorf("console URL is missing")
+	}
+
+	config, err := loadKubeconfigContents(kubeconfig)
+	if err != nil {
+		return clusterAccessDetails{}, fmt.Errorf("unable to parse kubeconfig for the API endpoint")
+	}
+	if config.Host == "" {
+		return clusterAccessDetails{}, fmt.Errorf("kubeconfig does not specify an API endpoint")
+	}
+
+	rawConfig, err := clientcmd.Load([]byte(kubeconfig))
+	if err != nil {
+		return clusterAccessDetails{}, fmt.Errorf("unable to parse kubeconfig context")
+	}
+	contextConfig, ok := rawConfig.Contexts[rawConfig.CurrentContext]
+	if !ok || contextConfig == nil {
+		return clusterAccessDetails{}, fmt.Errorf("kubeconfig current context is missing")
+	}
+	clusterConfig, ok := rawConfig.Clusters[contextConfig.Cluster]
+	if !ok || clusterConfig == nil {
+		return clusterAccessDetails{}, fmt.Errorf("kubeconfig current cluster is missing")
+	}
+
+	details := clusterAccessDetails{ConsoleURL: consoleURL, APIURL: config.Host}
+	if password := strings.TrimSpace(string(secretData["kubeadmin-password"])); password != "" {
+		details.ConsoleUsername = "kubeadmin"
+		details.ConsolePassword = password
+	}
+
+	if platform == "metal" {
+		proxyURL, parseErr := url.Parse(clusterConfig.ProxyURL)
+		proxyHost := ""
+		if parseErr == nil && proxyURL != nil {
+			proxyHost = proxyURL.Host
+		}
+		if proxyHost != "" {
+			details.AccessInstructions = fmt.Sprintf(
+				"Metal cluster access requires its proxy. Set both `http_proxy` and `https_proxy` to `%s` before using the console or API; the returned kubeconfig also contains this proxy configuration.",
+				proxyHost,
+			)
+		} else {
+			details.AccessInstructions = "Metal cluster access requires a proxy. Use the `proxy-url` value in the returned kubeconfig for both `http_proxy` and `https_proxy` before using the console or API."
+		}
+		if details.ConsoleUsername != "" {
+			details.AccessInstructions += " Sign in to the console with the returned console username and password."
+		}
+		return details, nil
+	}
+
+	details.AccessInstructions = "Use the returned kubeconfig for command-line access to the cluster."
+	if details.ConsoleUsername != "" {
+		details.AccessInstructions += " Sign in to the OpenShift console with the returned console username and password."
+	}
+	return details, nil
+}
+
+type keyedMutex struct {
+	mu    sync.Mutex
+	locks map[string]*keyedLock
+}
+
+type keyedLock struct {
+	mu   sync.Mutex
+	refs int
+}
+
+// lock serializes operations on one job and returns a release function. The
+// reference count keeps the lock map bounded after jobs stop being touched.
+func (m *keyedMutex) lock(key string) func() {
+	m.mu.Lock()
+	if m.locks == nil {
+		m.locks = make(map[string]*keyedLock)
+	}
+	lock, ok := m.locks[key]
+	if !ok {
+		lock = &keyedLock{}
+		m.locks[key] = lock
+	}
+	lock.refs++
+	m.mu.Unlock()
+
+	lock.mu.Lock()
+	return func() {
+		lock.mu.Unlock()
+		m.mu.Lock()
+		lock.refs--
+		if lock.refs == 0 {
+			delete(m.locks, key)
+		}
+		m.mu.Unlock()
+	}
+}
+
+func lifecycleError(code, message string, retryable bool, jobID string) error {
+	return ToolError{Code: code, Message: message, Retryable: retryable, JobID: jobID}
+}
+
+func validateLifecycleRequest(user, jobID string) error {
+	if strings.TrimSpace(user) == "" {
+		return lifecycleError(ToolErrorCodeInvalidArguments, "slack_user_id is required", false, jobID)
+	}
+	if strings.TrimSpace(jobID) == "" {
+		return lifecycleError(ToolErrorCodeInvalidArguments, "job_id is required", false, jobID)
+	}
+	return nil
+}
+
+func notFound(jobID string) error {
+	return lifecycleError(ToolErrorCodeNotFound, "cluster not found", false, jobID)
+}
+
+// unacceptedLaunchStatusError reports a retryable initialization result for an
+// owned reservation Prow has not recorded yet, instead of NOT_FOUND.
+func (m *jobManager) unacceptedLaunchStatusError(user, jobID string) error {
+	m.lock.RLock()
+	defer m.lock.RUnlock()
+	current := m.jobs[jobID]
+	if current == nil || current.RequestedBy != user || current.Mode != JobTypeLaunch ||
+		current.ProwJobAccepted || !clusterLaunchActive(current) {
+		return notFound(jobID)
+	}
+	return lifecycleError(ToolErrorCodeLaunchInitialization,
+		"the cluster launch is still being initialized; retry shortly", true, jobID)
+}
+
+func backendUnavailable(jobID string, _ error) error {
+	return lifecycleError(ToolErrorCodeBackendUnavailable, "cluster state is temporarily unavailable", true, jobID)
+}
+
+// cloneJob makes a detached snapshot before returning state outside the
+// manager lock. JobInput contains Prow refs with nested slices, and the job
+// parameters map is mutable, so both need deep copies.
+func cloneJob(job *Job) *Job {
+	if job == nil {
+		return nil
+	}
+	copy := *job
+	copy.JobParams = maps.Clone(job.JobParams)
+	copy.Inputs = make([]JobInput, len(job.Inputs))
+	for i, input := range job.Inputs {
+		copy.Inputs[i] = input
+		copy.Inputs[i].Refs = make([]prowapiv1.Refs, len(input.Refs))
+		for j := range input.Refs {
+			copy.Inputs[i].Refs[j] = *input.Refs[j].DeepCopy()
+		}
+	}
+	if job.CompletedAt != nil {
+		completedAt := *job.CompletedAt
+		copy.CompletedAt = &completedAt
+	}
+	return &copy
+}
+
+func (m *jobManager) cachedJobSnapshot(jobID string) *Job {
+	m.lock.RLock()
+	defer m.lock.RUnlock()
+	return cloneJob(m.jobs[jobID])
+}
+
+// prowJobMatches reports whether pj is a Cluster Bot launch ProwJob requested
+// by user with the given mode.
+func prowJobMatches(pj *prowapiv1.ProwJob, user, mode string) bool {
+	return pj != nil &&
+		pj.Annotations["ci-chat-bot.openshift.io/user"] == user &&
+		pj.Annotations["ci-chat-bot.openshift.io/mode"] == mode &&
+		pj.Labels[utils.LaunchLabel] == "true"
+}
+
+func (m *jobManager) getOwnedProwJob(ctx context.Context, user, jobID, mode string) (*prowapiv1.ProwJob, error) {
+	if err := validateLifecycleRequest(user, jobID); err != nil {
+		return nil, err
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if m.prowClient == nil {
+		return nil, backendUnavailable(jobID, fmt.Errorf("prow client is unavailable"))
+	}
+	pj, err := m.prowClient.ProwJobs(m.prowNamespace).Get(ctx, jobID, metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		return nil, notFound(jobID)
+	}
+	if err != nil {
+		return nil, backendUnavailable(jobID, err)
+	}
+	if !prowJobMatches(pj, user, mode) {
+		return nil, notFound(jobID)
+	}
+	return pj, nil
+}
+
+func isTerminalProwState(state prowapiv1.ProwJobState) bool {
+	switch state {
+	case prowapiv1.AbortedState, prowapiv1.ErrorState, prowapiv1.FailureState, prowapiv1.SuccessState:
+		return true
+	default:
+		return false
+	}
+}
+
+func lifecycleStatus(job *Job, pj *prowapiv1.ProwJob, now time.Time) string {
+	if job != nil && job.TerminationRequested {
+		switch pj.Status.State {
+		case prowapiv1.AbortedState:
+			if pj.Status.CompletionTime != nil {
+				return clusterStatusTerminated
+			}
+			return clusterStatusTerminating
+		case prowapiv1.SuccessState:
+			return clusterStatusTerminated
+		case prowapiv1.FailureState, prowapiv1.ErrorState:
+			return clusterStatusFailed
+		default:
+			return clusterStatusTerminating
+		}
+	}
+	switch pj.Status.State {
+	case prowapiv1.AbortedState:
+		return clusterStatusTerminated
+	case prowapiv1.ErrorState, prowapiv1.FailureState:
+		return clusterStatusFailed
+	case prowapiv1.SuccessState:
+		return clusterStatusTerminated
+	}
+	if job != nil && !job.ExpiresAt.IsZero() && !now.Before(job.ExpiresAt) {
+		return clusterStatusExpired
+	}
+	if job != nil && job.Failure != "" {
+		return clusterStatusFailed
+	}
+	if job != nil && job.Credentials != "" {
+		return clusterStatusReady
+	}
+	return clusterStatusProvisioning
+}
+
+func mergeCachedJobAccess(job, cached *Job) {
+	if job == nil || cached == nil || job.Name != cached.Name || job.Mode != cached.Mode || job.RequestedBy != cached.RequestedBy {
+		return
+	}
+	job.NotificationSent = job.NotificationSent || cached.NotificationSent
+	job.Credentials = cached.Credentials
+	job.CredentialsSnippet = cached.CredentialsSnippet
+	job.ConsoleURL = cached.ConsoleURL
+	job.APIURL = cached.APIURL
+	job.ConsoleUsername = cached.ConsoleUsername
+	job.ConsolePassword = cached.ConsolePassword
+	job.AccessInstructions = cached.AccessInstructions
+	job.Failure = cached.Failure
+	job.StartDuration = cached.StartDuration
+	job.TerminationRequested = job.TerminationRequested || cached.TerminationRequested
+	if job.CompletedAt == nil && cached.CompletedAt != nil {
+		completedAt := *cached.CompletedAt
+		job.CompletedAt = &completedAt
+	}
+	job.Complete = job.Complete || cached.Complete
+	job.ProwJobAccepted = job.ProwJobAccepted || cached.ProwJobAccepted
+}
+
+func (m *jobManager) snapshotForProwJob(pj *prowapiv1.ProwJob) (*Job, error) {
+	job, err := clusterJobFromProwJob(pj, m.maxAge)
+	if err != nil {
+		return nil, lifecycleError(ToolErrorCodeInternal, "cluster metadata could not be read", false, pj.Name)
+	}
+	mergeCachedJobAccess(job, m.cachedJobSnapshot(pj.Name))
+	applyProwJobStatus(job, pj)
+	return job, nil
+}
+
+// applyProwJobStatus copies the durable ProwJob state onto job: state, logs
+// URL, termination marker, and completion. Access is cleared for a terminating
+// or terminal job. Callers that merge cached monitor state must merge first so
+// that this clearing wins over credentials copied from the cache.
+func applyProwJobStatus(job *Job, pj *prowapiv1.ProwJob) {
+	job.State = pj.Status.State
+	job.URL = pj.Status.URL
+	job.TerminationRequested = job.TerminationRequested || pj.Annotations[annotationTerminationRequested] == terminationMarkerValue
+	if pj.Status.CompletionTime != nil {
+		completedAt := pj.Status.CompletionTime.Time
+		job.CompletedAt = &completedAt
+		job.Complete = true
+	}
+	if job.TerminationRequested || isTerminalProwState(pj.Status.State) {
+		clearJobAccess(job)
+	}
+}
+
+func reconcileMonitorJobWithProw(job *Job, pj *prowapiv1.ProwJob) {
+	if job == nil || pj == nil {
+		return
+	}
+	applyProwJobStatus(job, pj)
+	if job.TerminationRequested {
+		job.RequestedChannel = ""
+		job.Failure = "deletion requested"
+	}
+}
+
+func clearJobAccess(job *Job) {
+	if job == nil {
+		return
+	}
+	job.Credentials = ""
+	job.CredentialsSnippet = ""
+	job.ConsoleURL = ""
+	job.APIURL = ""
+	job.ConsoleUsername = ""
+	job.ConsolePassword = ""
+	job.AccessInstructions = ""
+}
+
+func (m *jobManager) refreshMonitorJobState(job *Job) bool {
+	if job == nil || m.prowClient == nil {
+		return job == nil || job.Mode != JobTypeLaunch
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	pj, err := m.prowClient.ProwJobs(m.prowNamespace).Get(ctx, job.Name, metav1.GetOptions{})
+	if err != nil {
+		if apierrors.IsNotFound(err) && job.Mode == JobTypeLaunch {
+			job.State = prowapiv1.ErrorState
+			job.Complete = true
+			job.Failure = "cluster launch job is no longer available"
+			job.ExpiresAt = time.Now().Add(15 * time.Minute)
+			clearJobAccess(job)
+			return true
+		}
+		return job.Mode != JobTypeLaunch
+	}
+	if !prowJobMatches(pj, job.RequestedBy, job.Mode) {
+		if job.Mode == JobTypeLaunch {
+			job.State = prowapiv1.ErrorState
+			job.Complete = true
+			job.Failure = "cluster launch ownership could not be verified"
+			job.RequestedChannel = ""
+			clearJobAccess(job)
+			return true
+		}
+		return false
+	}
+	reconcileMonitorJobWithProw(job, pj)
+	return true
+}
+
+func clusterInputs(job *Job) [][]string {
+	if job == nil || len(job.Inputs) == 0 {
+		return nil
+	}
+	inputs := make([][]string, 0, len(job.Inputs))
+	for _, input := range job.Inputs {
+		current := make([]string, 0, 1+len(input.Refs))
+		switch {
+		case input.Version != "":
+			current = append(current, input.Version)
+		case input.Image != "":
+			current = append(current, input.Image)
+		case input.RunImage != "":
+			current = append(current, input.RunImage)
+		}
+		for _, ref := range input.Refs {
+			for _, pull := range ref.Pulls {
+				current = append(current, fmt.Sprintf("%s/%s#%d", ref.Org, ref.Repo, pull.Number))
+			}
+		}
+		if len(current) > 0 {
+			inputs = append(inputs, current)
+		}
+	}
+	return inputs
+}
+
+func clusterSummary(job *Job, pj *prowapiv1.ProwJob, now time.Time) ClusterSummary {
+	status := lifecycleStatus(job, pj, now)
+	summary := ClusterSummary{
+		JobID:        job.Name,
+		SlackUserID:  job.RequestedBy,
+		UserName:     job.RequesterUserID,
+		Status:       status,
+		Inputs:       clusterInputs(job),
+		Platform:     job.Platform,
+		Architecture: job.Architecture,
+		Parameters:   maps.Clone(job.JobParams),
+		RequestedAt:  job.RequestedAt,
+		ExpiresAt:    job.ExpiresAt,
+		CompletedAt:  job.CompletedAt,
+		LogsURL:      pj.Status.URL,
+	}
+	if job.CompletedAt != nil {
+		completedAt := *job.CompletedAt
+		summary.CompletedAt = &completedAt
+	}
+	if status == clusterStatusReady {
+		summary.ConsoleURL = job.ConsoleURL
+		summary.APIURL = job.APIURL
+	}
+	if status == clusterStatusFailed {
+		summary.Failure = "The cluster launch did not complete successfully."
+	}
+	return summary
+}
+
+// GetClusterStatus returns an owner-verified status snapshot. Prow is read on
+// every request so stale in-memory credentials can never hide a terminal job.
+func (m *jobManager) GetClusterStatus(ctx context.Context, user, jobID string) (ClusterSummary, error) {
+	if err := validateLifecycleRequest(user, jobID); err != nil {
+		return ClusterSummary{}, err
+	}
+	pj, err := m.getOwnedProwJob(ctx, user, jobID, JobTypeLaunch)
+	if err != nil {
+		if isToolErrorCode(err, ToolErrorCodeNotFound) {
+			return ClusterSummary{}, m.unacceptedLaunchStatusError(user, jobID)
+		}
+		return ClusterSummary{}, err
+	}
+	job, err := m.snapshotForProwJob(pj)
+	if err != nil {
+		return ClusterSummary{}, err
+	}
+	return clusterSummary(job, pj, time.Now()), nil
+}
+
+// GetClusterCredentials only returns credentials reconstructed by the existing
+// monitor and held in the in-memory cache. A restart therefore reports them as
+// unavailable until that monitor has passed its readiness checks again.
+func (m *jobManager) GetClusterCredentials(ctx context.Context, user, jobID string) (ClusterCredentials, error) {
+	if err := validateLifecycleRequest(user, jobID); err != nil {
+		return ClusterCredentials{}, err
+	}
+	unlock := m.lifecycleLocks.lock(jobID)
+	defer unlock()
+
+	pj, err := m.getOwnedProwJob(ctx, user, jobID, JobTypeLaunch)
+	if err != nil {
+		if isToolErrorCode(err, ToolErrorCodeNotFound) {
+			return ClusterCredentials{}, m.unacceptedLaunchStatusError(user, jobID)
+		}
+		return ClusterCredentials{}, err
+	}
+	job, err := m.snapshotForProwJob(pj)
+	if err != nil {
+		return ClusterCredentials{}, err
+	}
+	status := lifecycleStatus(job, pj, time.Now())
+	if status != clusterStatusReady || job.Credentials == "" {
+		retryable := status == clusterStatusProvisioning || status == clusterStatusReady
+		return ClusterCredentials{}, lifecycleError(ToolErrorCodeCredentialsUnavailable, "cluster credentials are not available", retryable, jobID)
+	}
+	if job.APIURL == "" {
+		// The monitor kept the kubeconfig for Slack but could not derive the
+		// structured access fields from the launch secret.
+		return ClusterCredentials{}, lifecycleError(ToolErrorCodeCredentialsUnavailable, "cluster access details are unavailable for this cluster", false, jobID)
+	}
+	return ClusterCredentials{
+		JobID:              jobID,
+		Kubeconfig:         job.Credentials,
+		ConsoleURL:         job.ConsoleURL,
+		APIURL:             job.APIURL,
+		ConsoleUsername:    job.ConsoleUsername,
+		ConsolePassword:    job.ConsolePassword,
+		AccessInstructions: job.AccessInstructions,
+	}, nil
+}
+
+// ListClusters returns active ordinary Prow launches owned by user. ProwJobs
+// are read from the informer cache, the same source sync uses. Launches that
+// were accepted after the cache last updated are added from the manager's job
+// records. Cached credentials are copied only after ownership has been checked.
+func (m *jobManager) ListClusters(ctx context.Context, user string) ([]ClusterSummary, error) {
+	if strings.TrimSpace(user) == "" {
+		return nil, lifecycleError(ToolErrorCodeInvalidArguments, "slack_user_id is required", false, "")
+	}
+	prowJobs, err := m.listLaunchProwJobs(ctx)
+	if err != nil {
+		return nil, err
+	}
+	clusters := make([]ClusterSummary, 0)
+	listed := make(map[string]bool, len(prowJobs))
+	now := time.Now()
+	for _, pj := range prowJobs {
+		listed[pj.Name] = true
+		if !prowJobMatches(pj, user, JobTypeLaunch) {
+			continue
+		}
+		job, err := m.snapshotForProwJob(pj)
+		if err != nil {
+			klog.Warningf("Skipping launch %s in cluster list: %v", pj.Name, err)
+			continue
+		}
+		status := lifecycleStatus(job, pj, now)
+		if status != clusterStatusProvisioning && status != clusterStatusReady && status != clusterStatusTerminating {
+			continue
+		}
+		clusters = append(clusters, clusterSummary(job, pj, now))
+	}
+	for _, job := range m.unlistedActiveLaunches(user, listed) {
+		pj := &prowapiv1.ProwJob{Status: prowapiv1.ProwJobStatus{State: job.State, URL: job.URL}}
+		clusters = append(clusters, clusterSummary(job, pj, now))
+	}
+	sort.Slice(clusters, func(i, j int) bool {
+		if !clusters[i].RequestedAt.Equal(clusters[j].RequestedAt) {
+			return clusters[i].RequestedAt.After(clusters[j].RequestedAt)
+		}
+		return clusters[i].JobID < clusters[j].JobID
+	})
+	return clusters, nil
+}
+
+// listLaunchProwJobs returns detached copies of the launch ProwJobs. It reads
+// Prow directly only when no informer cache is configured.
+func (m *jobManager) listLaunchProwJobs(ctx context.Context) ([]*prowapiv1.ProwJob, error) {
+	selector := labels.SelectorFromSet(labels.Set{utils.LaunchLabel: "true"})
+	if m.prowLister != nil {
+		cached, err := m.prowLister.ProwJobs(m.prowNamespace).List(selector)
+		if err != nil {
+			return nil, backendUnavailable("", err)
+		}
+		prowJobs := make([]*prowapiv1.ProwJob, 0, len(cached))
+		for _, pj := range cached {
+			prowJobs = append(prowJobs, pj.DeepCopy())
+		}
+		return prowJobs, nil
+	}
+	if m.prowClient == nil {
+		return nil, backendUnavailable("", fmt.Errorf("prow client is unavailable"))
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	pjList, err := m.prowClient.ProwJobs(m.prowNamespace).List(ctx, metav1.ListOptions{LabelSelector: selector.String()})
+	if err != nil {
+		return nil, backendUnavailable("", err)
+	}
+	prowJobs := make([]*prowapiv1.ProwJob, 0, len(pjList.Items))
+	for i := range pjList.Items {
+		prowJobs = append(prowJobs, &pjList.Items[i])
+	}
+	return prowJobs, nil
+}
+
+// unlistedActiveLaunches returns snapshots of user's active ordinary launches
+// that are not in listed, such as a launch accepted moments ago. A launch Prow
+// has not recorded yet is left out until Prow accepts it.
+func (m *jobManager) unlistedActiveLaunches(user string, listed map[string]bool) []*Job {
+	m.lock.RLock()
+	defer m.lock.RUnlock()
+	var jobs []*Job
+	request := m.requests[user]
+	for name, job := range m.jobs {
+		if listed[name] || job == nil || job.RequestedBy != user || job.Mode != JobTypeLaunch ||
+			!job.ProwJobAccepted || !clusterLaunchActive(job) {
+			continue
+		}
+		if request != nil && request.Name == name && request.SubmissionInProgress {
+			continue
+		}
+		jobs = append(jobs, cloneJob(job))
+	}
+	return jobs
+}
+
+func (m *jobManager) requestProwJobTermination(ctx context.Context, user, jobID, mode string) (*prowapiv1.ProwJob, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if m.prowClient == nil {
+		return nil, backendUnavailable(jobID, fmt.Errorf("prow client is unavailable"))
+	}
+	var updated *prowapiv1.ProwJob
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		pj, err := m.prowClient.ProwJobs(m.prowNamespace).Get(ctx, jobID, metav1.GetOptions{})
+		if apierrors.IsNotFound(err) {
+			return notFound(jobID)
+		}
+		if err != nil {
+			return err
+		}
+		if !prowJobMatches(pj, user, mode) {
+			return notFound(jobID)
+		}
+		if pj.Annotations[annotationTerminationRequested] == terminationMarkerValue &&
+			(pj.Status.State == prowapiv1.AbortedState || isTerminalProwState(pj.Status.State)) {
+			updated = pj
+			return nil
+		}
+
+		candidate := pj.DeepCopy()
+		if candidate.Annotations == nil {
+			candidate.Annotations = make(map[string]string)
+		}
+		candidate.Annotations[annotationTerminationRequested] = terminationMarkerValue
+		if !isTerminalProwState(candidate.Status.State) {
+			candidate.Status.State = prowapiv1.AbortedState
+		}
+		updated, err = m.prowClient.ProwJobs(m.prowNamespace).Update(ctx, candidate, metav1.UpdateOptions{})
+		return err
+	})
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, notFound(jobID)
+		}
+		if _, ok := err.(ToolError); ok {
+			return nil, err
+		}
+		return nil, backendUnavailable(jobID, err)
+	}
+	return updated, nil
+}
+
+// DestroyCluster requests cancellation for exactly jobID. It retains the
+// ProwJob, records a durable marker, and clears only a matching user
+// reservation so a later cluster cannot be affected by an old ID. Only
+// ordinary launches can be destroyed this way.
+func (m *jobManager) DestroyCluster(ctx context.Context, user, jobID string) (TerminationResult, error) {
+	return m.destroyClusterWithMode(ctx, user, jobID, JobTypeLaunch)
+}
+
+// destroyClusterWithMode is DestroyCluster for a launch of the given cluster
+// launch mode.
+func (m *jobManager) destroyClusterWithMode(ctx context.Context, user, jobID, mode string) (TerminationResult, error) {
+	if err := validateLifecycleRequest(user, jobID); err != nil {
+		return TerminationResult{}, err
+	}
+	unlock := m.lifecycleLocks.lock(jobID)
+	defer unlock()
+
+	if _, err := m.getOwnedProwJob(ctx, user, jobID, mode); err != nil {
+		if isToolErrorCode(err, ToolErrorCodeNotFound) {
+			if result, ok, phantomErr := m.destroyPhantomReservation(user, jobID, mode); ok || phantomErr != nil {
+				return result, phantomErr
+			}
+		}
+		return TerminationResult{}, err
+	}
+	pj, err := m.requestProwJobTermination(ctx, user, jobID, mode)
+	if err != nil {
+		return TerminationResult{}, err
+	}
+
+	m.lock.Lock()
+	if current := m.jobs[jobID]; current != nil && current.RequestedBy == user && current.Mode == mode {
+		updated := cloneJob(current)
+		applyProwJobStatus(updated, pj)
+		markJobTerminationRequested(updated)
+		m.jobs[jobID] = updated
+	}
+	if request := m.requests[user]; request != nil && request.Name == jobID {
+		delete(m.requests, user)
+	}
+	m.lock.Unlock()
+
+	job, err := m.snapshotForProwJob(pj)
+	if err != nil {
+		// The termination has already been persisted. Return its state even if
+		// older launch metadata is malformed.
+		job = &Job{Name: jobID, RequestedBy: user, Mode: mode, TerminationRequested: true}
+	}
+	status := lifecycleStatus(job, pj, time.Now())
+	return TerminationResult{JobID: jobID, Status: status}, nil
+}
+
+func isToolErrorCode(err error, code string) bool {
+	var toolErr ToolError
+	return errors.As(err, &toolErr) && toolErr.Code == code
+}
+
+// needsPersistedTermination reports whether a cached launch carries a
+// termination request that the durable ProwJob does not yet have. This happens
+// when a user destroys a reservation whose ProwJob was not yet visible: Prow
+// must still be told to cancel it once the ProwJob appears.
+func needsPersistedTermination(previous, durable *Job) bool {
+	if previous == nil || durable == nil || !isClusterLaunchMode(durable.Mode) {
+		return false
+	}
+	if !previous.TerminationRequested || durable.TerminationRequested {
+		return false
+	}
+	if previous.Name != durable.Name || previous.RequestedBy != durable.RequestedBy || previous.Mode != durable.Mode {
+		return false
+	}
+	return !isTerminalProwState(durable.State)
+}
+
+// markJobTerminationRequested records a user's deletion request on a cached
+// job. Access is cleared and the record expires shortly, as for Slack `done`.
+func markJobTerminationRequested(job *Job) {
+	job.TerminationRequested = true
+	job.Complete = true
+	job.RequestedChannel = ""
+	job.Failure = "deletion requested"
+	job.ExpiresAt = time.Now().Add(15 * time.Minute)
+	clearJobAccess(job)
+}
+
+// destroyPhantomReservation handles a launch whose ProwJob was never created
+// or has been removed. The user's local launch record is released so the user
+// can launch again: a finished record, whose ProwJob may have aged out of
+// retention, is dropped, and an unfinished one is marked for deletion. ok is
+// false when there is no such record, and the caller then reports NOT_FOUND.
+func (m *jobManager) destroyPhantomReservation(user, jobID, mode string) (result TerminationResult, ok bool, err error) {
+	m.lock.Lock()
+	defer m.lock.Unlock()
+	current := m.jobs[jobID]
+	if current == nil || current.RequestedBy != user || !isClusterLaunchMode(current.Mode) || current.Mode != mode {
+		return TerminationResult{}, false, nil
+	}
+	request := m.requests[user]
+	if request != nil && request.Name == jobID && request.SubmissionInProgress {
+		return TerminationResult{}, false, lifecycleError(ToolErrorCodeLaunchInitialization, "the cluster launch is still being submitted; retry shortly", true, jobID)
+	}
+	if current.Complete || current.TerminationRequested || isTerminalProwState(current.State) {
+		delete(m.jobs, jobID)
+		if request != nil && request.Name == jobID {
+			delete(m.requests, user)
+		}
+		klog.Infof("user %q destroyed finished launch %q, which has no ProwJob; released its record", user, jobID)
+		return TerminationResult{JobID: jobID, Status: clusterStatusTerminated}, true, nil
+	}
+	updated := cloneJob(current)
+	markJobTerminationRequested(updated)
+	m.jobs[jobID] = updated
+	if matchesClusterReservation(request, jobRequestFromClusterJob(current)) {
+		delete(m.requests, user)
+	}
+	klog.Infof("user %q destroyed launch %q, which has no ProwJob; released its reservation", user, jobID)
+	return TerminationResult{JobID: jobID, Status: clusterStatusTerminating}, true, nil
+}

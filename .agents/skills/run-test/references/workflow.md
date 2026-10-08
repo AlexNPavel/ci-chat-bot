@@ -62,6 +62,7 @@ You are helping the user run a test instance of the ci-chat-bot. Follow these st
      ngrok http 8080 > /tmp/ci-chat-bot/ngrok.log 2>&1 &
      echo $! > /tmp/ci-chat-bot/ngrok.pid
      ```
+     If the user wants to test the MCP endpoint (`/mcp`) through the tunnel, add `--host-header=rewrite` to the ngrok command. The MCP SDK rejects requests that arrive on a loopback listener with a non-loopback `Host` header, so `/mcp` returns 403 through an unmodified tunnel. Slack endpoints work either way. An existing tunnel started without the flag must be restarted to add it; ask the user first, because its URL may change.
    - Extract and display the public HTTPS URL that ngrok provides
    - The URL will look like: `https://xxxx-xx-xx-xx-xx.ngrok-free.app`
    - Inform the user they need to configure this URL in their Slack app settings:
