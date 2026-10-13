@@ -141,8 +141,13 @@ func OverrideJobEnvVar(spec *prowapiv1.ProwJobSpec, name, value string) {
 
 func prowSpecForPeriodicConfig(config *config.Periodic) *prowapiv1.ProwJobSpec {
 	spec := pjutil.PeriodicSpec(*config)
-	isTrue := true
-	spec.DecorationConfig.SkipCloning = &isTrue
+	if spec.DecorationConfig != nil {
+		// the spec shares the periodic's DecorationConfig with the live prow
+		// config, so copy it before mutating to avoid writing through to it
+		spec.DecorationConfig = spec.DecorationConfig.DeepCopy()
+		isTrue := true
+		spec.DecorationConfig.SkipCloning = &isTrue
+	}
 	return &spec
 }
 

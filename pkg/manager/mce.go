@@ -30,6 +30,25 @@ import (
 
 var MCEPlatforms = sets.New([]string{"aws", "gcp"}...)
 
+// maxRetainedInstallLog bounds how much of a provision's install log is kept in
+// memory between syncs. The full log is uploaded to the user when a failure is
+// first observed; only later re-fetches (e.g. `mce auth`) see the trimmed log.
+const maxRetainedInstallLog = 1 << 20
+
+// trimInstallLog drops all but the tail of an install log that exceeds
+// maxRetainedInstallLog, since the reason for a failed install is at the end.
+func trimInstallLog(provision *hivev1.ClusterProvision) {
+	if provision.Spec.InstallLog == nil {
+		return
+	}
+	installLog := *provision.Spec.InstallLog
+	if len(installLog) <= maxRetainedInstallLog {
+		return
+	}
+	trimmed := fmt.Sprintf("[... install log truncated to the last %d bytes ...]\n%s", maxRetainedInstallLog, installLog[len(installLog)-maxRetainedInstallLog:])
+	provision.Spec.InstallLog = &trimmed
+}
+
 // mceClusterIsAWS reports whether the managed cluster runs on AWS. Hive ClusterDeployment may be
 // absent while a custom image build is in progress; ManagedCluster labels are set at creation.
 func mceClusterIsAWS(mc *clusterv1.ManagedCluster, cd *hivev1.ClusterDeployment) bool {

@@ -20,6 +20,9 @@ import (
 
 var LaunchLabel = "ci-chat-bot.openshift.io/launch"
 
+// ProwJobNamespace is the namespace in which the bot creates and watches ProwJobs.
+const ProwJobNamespace = "ci"
+
 const BaseDomain = "ci-chat-bot/base-domain"
 const CoreOSURL = "https://coreos.slack.com"
 const UserTag = "ci-chat-bot/user"

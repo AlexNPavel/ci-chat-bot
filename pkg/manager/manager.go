@@ -175,7 +175,7 @@ func NewJobManager(
 		prowLister:       prowInformer.Lister(),
 		imageClient:      imageClient,
 		clusterClients:   buildClusterClientConfigMap,
-		prowNamespace:    "ci",
+		prowNamespace:    utils.ProwJobNamespace,
 		forcePROwner:     forcePROwner,
 
 		configResolver: configResolver,
@@ -517,10 +517,27 @@ func (m *jobManager) mceSync() error {
 	klog.Infof("Found %d chat-bot owned mce clusters", len(managedClusters))
 	mceAWSClustersMetric.Set(float64(awsClusters))
 	mceGCPClustersMetric.Set(float64(gcpClusters))
+	// the provision objects were just fetched and are not shared with readers
+	// yet, so they can be trimmed in place before being published
+	for _, provision := range provisions {
+		trimInstallLog(provision)
+	}
 	m.mceClusters.lock.Lock()
 	m.mceClusters.clusters = managedClusters
 	m.mceClusters.deployments = clusterDeployments
 	m.mceClusters.provisions = provisions
+	// drop cached credentials for clusters that no longer exist so the maps
+	// do not grow without bound over the bot's lifetime
+	for name := range m.mceClusters.clusterKubeconfigs {
+		if _, ok := managedClusters[name]; !ok {
+			delete(m.mceClusters.clusterKubeconfigs, name)
+		}
+	}
+	for name := range m.mceClusters.clusterPasswords {
+		if _, ok := managedClusters[name]; !ok {
+			delete(m.mceClusters.clusterPasswords, name)
+		}
+	}
 	m.mceClusters.lock.Unlock()
 	userConfig, err := m.dpcrCoreClient.ConfigMaps("crt-argocd").Get(context.TODO(), "users", metav1.GetOptions{})
 	if err != nil {

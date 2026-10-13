@@ -250,6 +250,11 @@ func GetUserName(client parser.SlackClient, userID string) string {
 	return ""
 }
 
+// maxVerifiedBodySize bounds how many bytes VerifiedBody will read from a
+// request before giving up; real Slack event and interaction payloads are far
+// smaller than this.
+const maxVerifiedBodySize = 1 << 20
+
 func VerifiedBody(request *http.Request, signingSecret string) ([]byte, bool) {
 	verifier, err := slack.NewSecretsVerifier(request.Header, signingSecret)
 	if err != nil {
@@ -257,6 +262,7 @@ func VerifiedBody(request *http.Request, signingSecret string) ([]byte, bool) {
 		return nil, false
 	}
 
+	request.Body = http.MaxBytesReader(nil, request.Body, maxVerifiedBodySize)
 	body, err := io.ReadAll(request.Body)
 	if err != nil {
 		klog.Errorf("Failed to read an event payload. %v", err)
@@ -342,13 +348,11 @@ func BuildJobParams(params string) (map[string]string, error) {
 	return jobParams, nil
 }
 
-const (
-	markdownLink = `^<(.*)\|(.*)>$`
-)
+// markdownLink matches Slack's markdown link syntax <URL|text>.
+var markdownLink = regexp.MustCompile(`^<(.*)\|(.*)>$`)
 
 func parseParameterValue(value string) string {
-	re, _ := regexp.Compile(markdownLink)
-	matches := re.FindStringSubmatch(value)
+	matches := markdownLink.FindStringSubmatch(value)
 	if len(matches) == 3 {
 		return matches[2]
 	}

@@ -53,7 +53,14 @@ func Start(bot *slack.Bot, jobManager manager.JobManager, httpclient *http.Clien
 	mux.Handle("/readyz", handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))) // report ready once the server is up and responding
 	mux.Handle("/slack/events-endpoint", handler(handleEvent(bot.BotSigningSecret, eventrouter.ForEvents(slackclient, jobManager, bot.SupportedCommands(), commandRecorders...))))
 	mux.Handle("/slack/interactive-endpoint", handler(handleInteraction(bot.BotSigningSecret, interactionrouter.ForModals(slackclient, jobManager, httpclient))))
-	server := &http.Server{Addr: ":" + strconv.Itoa(bot.Port), Handler: mux, ReadHeaderTimeout: 10 * time.Second}
+	server := &http.Server{
+		Addr:              ":" + strconv.Itoa(bot.Port),
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       2 * time.Minute,
+	}
 	health.ServeReady(func() bool {
 		resp, err := http.DefaultClient.Get("http://127.0.0.1:" + strconv.Itoa(bot.Port) + "/readyz")
 		if resp != nil {
