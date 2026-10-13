@@ -10,10 +10,12 @@ import (
 	"net/mail"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/openshift/ci-chat-bot/pkg/manager"
 	"github.com/slack-go/slack"
+	"k8s.io/apimachinery/pkg/util/cache"
 )
 
 func (s *service) registerTools(server *mcp.Server) {
@@ -45,9 +47,6 @@ func (s *service) registerTools(server *mcp.Server) {
 		var input launchClusterInput
 		if err := decodeArguments(raw, &input); err != nil {
 			return nil, invalidArguments()
-		}
-		if err := validateSlackID(input.SlackUserID); err != nil {
-			return nil, err
 		}
 		if strings.TrimSpace(input.RequestID) == "" || len(input.RequestID) > 128 || input.RequestID != strings.TrimSpace(input.RequestID) {
 			return nil, invalidArguments()
@@ -162,9 +161,6 @@ func (s *service) registerTools(server *mcp.Server) {
 		if err := decodeArguments(raw, &input); err != nil {
 			return nil, invalidArguments()
 		}
-		if err := validateSlackID(input.SlackUserID); err != nil {
-			return nil, err
-		}
 		identity, err := s.identity.resolve(ctx, input.SlackUserID)
 		if err != nil {
 			return nil, err
@@ -226,20 +222,39 @@ type verifiedIdentity struct {
 	UserName    string
 }
 
+// identityCacheTTL bounds how long a verified identity is reused before Slack
+// is asked again, so a deactivated user loses access quickly.
+const identityCacheTTL = 30 * time.Second
+
 type identityResolver struct {
 	mu    sync.Mutex
 	slack SlackClient
 	team  string
+	// verified caches successful resolutions by Slack user ID. Failures and
+	// rejections are never cached.
+	verified *cache.LRUExpireCache
 }
 
 func newIdentityResolver(client SlackClient) *identityResolver {
-	return &identityResolver{slack: client}
+	return &identityResolver{slack: client, verified: cache.NewLRUExpireCache(1024)}
 }
 
 func (r *identityResolver) resolve(ctx context.Context, userID string) (verifiedIdentity, error) {
 	if err := validateSlackID(userID); err != nil {
 		return verifiedIdentity{}, err
 	}
+	if cached, ok := r.verified.Get(userID); ok {
+		return cached.(verifiedIdentity), nil
+	}
+	identity, err := r.lookup(ctx, userID)
+	if err != nil {
+		return verifiedIdentity{}, err
+	}
+	r.verified.Add(userID, identity, identityCacheTTL)
+	return identity, nil
+}
+
+func (r *identityResolver) lookup(ctx context.Context, userID string) (verifiedIdentity, error) {
 	teamID, err := r.workspace(ctx)
 	if err != nil {
 		return verifiedIdentity{}, err

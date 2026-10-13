@@ -515,7 +515,7 @@ func (m *jobManager) newJobWithContext(ctx context.Context, job *Job, waitForURL
 
 	sourceConfig, srcNamespace, srcName, err := loadJobConfigSpecWithContext(ctx, clusterClient.CoreClient, sourceEnv, "ci")
 	if err != nil {
-		return "", fmt.Errorf("the launch job definition could not be loaded: %v", err)
+		return "", fmt.Errorf("the launch job definition could not be loaded: %w", err)
 	}
 
 	// errors should never occur here as this has already been checked by the calling function
@@ -696,7 +696,7 @@ func (m *jobManager) newJobWithContext(ctx context.Context, job *Job, waitForURL
 
 		is, err := clusterClient.TargetImageClient.ImageV1().ImageStreams("openshift").Get(ctx, "cli", metav1.GetOptions{})
 		if err != nil {
-			return "", fmt.Errorf("unable to lookup registry URL for job")
+			return "", fmt.Errorf("unable to lookup registry URL for job: %w", err)
 		}
 		registryHost, _, _ := strings.Cut(is.Status.PublicDockerImageRepository, "/")
 
@@ -768,7 +768,7 @@ func (m *jobManager) newJobWithContext(ctx context.Context, job *Job, waitForURL
 			for _, ref := range input.Refs {
 				configData, ok, err := resolveConfigWithContext(ctx, m.configResolver, ref.Org, ref.Repo, ref.BaseRef, "")
 				if err != nil {
-					return "", fmt.Errorf("could not resolve config for %s/%s/%s: %v", ref.Org, ref.Repo, ref.BaseRef, err)
+					return "", fmt.Errorf("could not resolve config for %s/%s/%s: %w", ref.Org, ref.Repo, ref.BaseRef, err)
 				}
 				if !ok {
 					return "", fmt.Errorf("there is no defined configuration for the organization %s with repo %s and branch %s", ref.Org, ref.Repo, ref.BaseRef)
@@ -1464,49 +1464,12 @@ func (m *jobManager) waitForJob(job *Job) error {
 		waitErr = fmt.Errorf("cluster did not become reachable: %v", err)
 	}
 
-	var kubeadminPassword string
-	var operatorDeploymentInfo string
-	if password, ok := secretDir.Data["kubeadmin-password"]; ok {
-		kubeadminPassword = strings.TrimSpace(string(password))
-	}
-	if deployment, ok := secretDir.Data["oo_deployment_details.yaml"]; ok {
-		operatorDeploymentInfo = string(deployment)
-	}
 	if waitErr == nil {
-		access, err := accessDetailsFromSecret(kubeconfig, secretDir.Data, job.Platform)
-		if err != nil {
-			job.Credentials = ""
-			job.CredentialsSnippet = ""
-			job.ConsoleURL = ""
-			job.APIURL = ""
-			job.ConsoleUsername = ""
-			job.ConsolePassword = ""
-			job.AccessInstructions = ""
-			return stderrors.New("unable to retrieve structured cluster access details")
-		}
-		job.ConsoleURL = access.ConsoleURL
-		job.APIURL = access.APIURL
-		job.ConsoleUsername = access.ConsoleUsername
-		job.ConsolePassword = access.ConsolePassword
-		job.AccessInstructions = access.AccessInstructions
-
-		job.CredentialsSnippet = access.ConsoleURL
-		if len(kubeadminPassword) > 0 {
-			job.CredentialsSnippet += fmt.Sprintf("\nLog in to the console with user `kubeadmin` and password `%s`", kubeadminPassword)
-			if len(operatorDeploymentInfo) > 0 {
-				job.CredentialsSnippet += fmt.Sprintf("\nThis following is the deployment information for you operator:\n%s", operatorDeploymentInfo)
-			}
-		} else {
-			job.CredentialsSnippet = "\nError: Unable to retrieve kubeadmin password, you must use the kubeconfig file to access the cluster"
+		if err := applyAccessDetails(job, kubeconfig, secretDir.Data); err != nil {
+			return fmt.Errorf("unable to retrieve console.url from step secret %s/%s", namespace, targetName)
 		}
 	} else {
-		job.Credentials = ""
-		job.CredentialsSnippet = ""
-		job.ConsoleURL = ""
-		job.APIURL = ""
-		job.ConsoleUsername = ""
-		job.ConsolePassword = ""
-		job.AccessInstructions = ""
+		clearJobAccess(job)
 	}
 
 	created := len(pj.Annotations["ci-chat-bot.openshift.io/expires"]) == 0
@@ -1514,6 +1477,41 @@ func (m *jobManager) waitForJob(job *Job) error {
 	m.clearNotificationAnnotations(job, created, startDuration)
 
 	return waitErr
+}
+
+// applyAccessDetails sets the Slack credential snippet and the structured
+// access fields from the launch secret. The kubeconfig is always kept. If the
+// structured fields cannot be derived, they stay empty and Slack users still
+// receive the kubeconfig and console URL. A missing console URL is an error.
+func applyAccessDetails(job *Job, kubeconfig string, secretData map[string][]byte) error {
+	clearJobAccess(job)
+	job.Credentials = kubeconfig
+
+	consoleURL := strings.TrimSpace(string(secretData["console.url"]))
+	if consoleURL == "" {
+		return stderrors.New("console URL is missing")
+	}
+	job.CredentialsSnippet = consoleURL
+	if kubeadminPassword := strings.TrimSpace(string(secretData["kubeadmin-password"])); len(kubeadminPassword) > 0 {
+		job.CredentialsSnippet += fmt.Sprintf("\nLog in to the console with user `kubeadmin` and password `%s`", kubeadminPassword)
+		if operatorDeploymentInfo := string(secretData["oo_deployment_details.yaml"]); len(operatorDeploymentInfo) > 0 {
+			job.CredentialsSnippet += fmt.Sprintf("\nThis following is the deployment information for you operator:\n%s", operatorDeploymentInfo)
+		}
+	} else {
+		job.CredentialsSnippet = "\nError: Unable to retrieve kubeadmin password, you must use the kubeconfig file to access the cluster"
+	}
+
+	access, err := accessDetailsFromSecret(kubeconfig, secretData, job.Platform)
+	if err != nil {
+		klog.Warningf("Job %q: structured cluster access details are unavailable: %v", job.Name, err)
+		return nil
+	}
+	job.ConsoleURL = access.ConsoleURL
+	job.APIURL = access.APIURL
+	job.ConsoleUsername = access.ConsoleUsername
+	job.ConsolePassword = access.ConsolePassword
+	job.AccessInstructions = access.AccessInstructions
+	return nil
 }
 
 // clearNotificationAnnotations removes the channel notification annotations in case we crash,
@@ -1798,7 +1796,7 @@ func loadJobConfigSpecWithContext(ctx context.Context, client clientset.Interfac
 	configMap, keyName := env.ValueFrom.ConfigMapKeyRef.Name, env.ValueFrom.ConfigMapKeyRef.Key
 	cm, err := client.CoreV1().ConfigMaps(namespace).Get(ctx, configMap, metav1.GetOptions{})
 	if err != nil {
-		return nil, "", "", fmt.Errorf("unable to identify a ci-operator configuration for the provided refs: %v", err)
+		return nil, "", "", fmt.Errorf("unable to identify a ci-operator configuration for the provided refs: %w", err)
 	}
 	configData, ok := cm.Data[keyName]
 	if !ok {

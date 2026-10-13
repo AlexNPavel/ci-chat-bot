@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -14,8 +15,10 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	k8stesting "k8s.io/client-go/testing"
+	"k8s.io/client-go/tools/cache"
 	prowapiv1 "sigs.k8s.io/prow/pkg/apis/prowjobs/v1"
 	prowfake "sigs.k8s.io/prow/pkg/client/clientset/versioned/fake"
+	prowjoblister "sigs.k8s.io/prow/pkg/client/listers/prowjobs/v1"
 )
 
 func lifecycleProwJob(name, user, mode string, state prowapiv1.ProwJobState, requestedAt time.Time) *prowapiv1.ProwJob {
@@ -44,10 +47,19 @@ func lifecycleProwJob(name, user, mode string, state prowapiv1.ProwJobState, req
 	}
 }
 
+// newLifecycleManager serves pjs from both a fake Prow client and an informer
+// cache. The cache is a snapshot; later client updates do not reach it.
 func newLifecycleManager(pjs ...runtime.Object) (*jobManager, *prowfake.Clientset) {
 	client := prowfake.NewSimpleClientset(pjs...)
+	indexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
+	for _, pj := range pjs {
+		if err := indexer.Add(pj.DeepCopyObject()); err != nil {
+			panic(fmt.Sprintf("could not add ProwJob to lifecycle lister: %v", err))
+		}
+	}
 	m := &jobManager{
 		prowClient:    client.ProwV1(),
+		prowLister:    prowjoblister.NewProwJobLister(indexer),
 		prowNamespace: "ci",
 		jobs:          make(map[string]*Job),
 		requests:      make(map[string]*JobRequest),
@@ -218,8 +230,13 @@ func TestListClustersIncludesOnlyActiveOrdinaryLaunchesForOwner(t *testing.T) {
 	workflow := lifecycleProwJob("workflow", "U123", JobTypeWorkflowLaunch, prowapiv1.PendingState, now.Add(-3*time.Minute))
 	failed := lifecycleProwJob("failed", "U123", JobTypeLaunch, prowapiv1.FailureState, now.Add(-4*time.Minute))
 	terminated := lifecycleProwJob("terminated", "U123", JobTypeLaunch, prowapiv1.SuccessState, now.Add(-5*time.Minute))
-	m, _ := newLifecycleManager(owned, other, workflow, failed, terminated)
+	malformed := lifecycleProwJob("malformed", "U123", JobTypeLaunch, prowapiv1.PendingState, now.Add(-6*time.Minute))
+	malformed.Annotations["ci-chat-bot.openshift.io/jobInputs"] = "{not json"
+	m, client := newLifecycleManager(owned, other, workflow, failed, terminated, malformed)
 	m.jobs[owned.Name] = cachedLifecycleJob(owned.Name, "U123", now.Add(-time.Minute))
+	client.PrependReactor("list", "prowjobs", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, errors.New("ListClusters must read the informer cache")
+	})
 
 	clusters, err := m.ListClusters(context.Background(), "U123")
 	if err != nil {
@@ -227,6 +244,38 @@ func TestListClustersIncludesOnlyActiveOrdinaryLaunchesForOwner(t *testing.T) {
 	}
 	if len(clusters) != 1 || clusters[0].JobID != owned.Name {
 		t.Fatalf("ListClusters returned %#v, want only %q", clusters, owned.Name)
+	}
+	if clusters[0].Status != clusterStatusReady || clusters[0].ConsoleURL != "https://console.example" {
+		t.Fatalf("ready cluster summary lost cached access: %#v", clusters[0])
+	}
+}
+
+func TestListClustersIncludesLaunchNotYetInCache(t *testing.T) {
+	now := time.Now().UTC()
+	m, _ := newLifecycleManager()
+	accepted := cachedLifecycleJob("accepted", "U123", now)
+	clearJobAccess(accepted)
+	accepted.URL = "https://prow.example/job/accepted"
+	m.jobs[accepted.Name] = accepted
+	submitting := cachedLifecycleJob("submitting", "U456", now)
+	clearJobAccess(submitting)
+	m.jobs[submitting.Name] = submitting
+	m.requests["U456"] = &JobRequest{User: "U456", Name: submitting.Name, SubmissionInProgress: true}
+	finished := cachedLifecycleJob("finished", "U123", now.Add(-time.Hour))
+	finished.Complete = true
+	finished.Failure = "job failed, see logs"
+	m.jobs[finished.Name] = finished
+
+	clusters, err := m.ListClusters(context.Background(), "U123")
+	if err != nil {
+		t.Fatalf("ListClusters returned error: %v", err)
+	}
+	if len(clusters) != 1 || clusters[0].JobID != accepted.Name || clusters[0].Status != clusterStatusProvisioning || clusters[0].LogsURL != accepted.URL {
+		t.Fatalf("ListClusters returned %#v, want the accepted launch as provisioning", clusters)
+	}
+	clusters, err = m.ListClusters(context.Background(), "U456")
+	if err != nil || len(clusters) != 0 {
+		t.Fatalf("ListClusters returned %#v, %v; want no launch still being submitted", clusters, err)
 	}
 }
 
@@ -625,5 +674,160 @@ func TestFinishedJobRetriesVerification(t *testing.T) {
 				t.Fatal("retry did not notify")
 			}
 		})
+	}
+}
+
+func phantomLaunchJob(name, user string, requestedAt time.Time) *Job {
+	job := cachedLifecycleJob(name, user, requestedAt)
+	clearJobAccess(job)
+	job.RequestSource = requestSourceSlack
+	job.BuildCluster = "build-cluster"
+	return job
+}
+
+func TestDestroyClusterReleasesReservationWithoutProwJob(t *testing.T) {
+	now := time.Now().UTC()
+	m, _ := newLifecycleManager()
+	m.launchReady = true
+	m.maxClusters = 10
+	m.maxAge = 3 * time.Hour
+	job := phantomLaunchJob("phantom", "U123", now.Add(-time.Minute))
+	m.jobs[job.Name] = job
+	m.requests["U123"] = &JobRequest{User: "U123", Name: job.Name, Type: JobTypeInstall, RequestSource: requestSourceSlack, RequestedAt: job.RequestedAt}
+
+	result, err := m.DestroyCluster(context.Background(), "U123", job.Name)
+	if err != nil {
+		t.Fatalf("DestroyCluster returned error: %v", err)
+	}
+	if result.JobID != job.Name || result.Status != clusterStatusTerminated {
+		t.Fatalf("result = %#v, want terminated %q", result, job.Name)
+	}
+	if _, ok := m.requests["U123"]; ok {
+		t.Fatalf("reservation was not released: %#v", m.requests["U123"])
+	}
+	stored := m.jobs[job.Name]
+	if !stored.TerminationRequested || !stored.Complete || stored.Failure != "deletion requested" {
+		t.Fatalf("cached job not marked for deletion: %#v", stored)
+	}
+
+	next := &JobRequest{User: "U123", Name: "next", Type: JobTypeInstall, RequestSource: requestSourceSlack, RequestedAt: now}
+	reserved, message, err := m.reserveClusterSubmission(next, &Job{Name: "next", Mode: JobTypeLaunch, RequestedBy: "U123", State: prowapiv1.PendingState})
+	if err != nil || message != "" || !reserved {
+		t.Fatalf("new launch was not admitted: reserved=%v message=%q err=%v", reserved, message, err)
+	}
+}
+
+func TestDestroyClusterWithoutProwJobOrLocalRecordIsNotFound(t *testing.T) {
+	m, _ := newLifecycleManager()
+	_, err := m.DestroyCluster(context.Background(), "U123", "missing")
+	if toolErr := toolErrorFrom(t, err); toolErr.Code != ToolErrorCodeNotFound {
+		t.Fatalf("error = %#v, want NOT_FOUND", toolErr)
+	}
+
+	// Another user's local record must not be released either.
+	m.jobs["other"] = phantomLaunchJob("other", "U456", time.Now())
+	m.requests["U456"] = &JobRequest{User: "U456", Name: "other", RequestSource: requestSourceSlack}
+	_, err = m.DestroyCluster(context.Background(), "U123", "other")
+	if toolErr := toolErrorFrom(t, err); toolErr.Code != ToolErrorCodeNotFound {
+		t.Fatalf("error = %#v, want NOT_FOUND", toolErr)
+	}
+	if m.requests["U456"] == nil || m.jobs["other"].TerminationRequested {
+		t.Fatal("destroy by another user changed the reservation")
+	}
+}
+
+func TestDestroyClusterWithoutProwJobWaitsForSubmission(t *testing.T) {
+	m, _ := newLifecycleManager()
+	job := phantomLaunchJob("submitting", "U123", time.Now())
+	m.jobs[job.Name] = job
+	m.requests["U123"] = &JobRequest{User: "U123", Name: job.Name, RequestSource: requestSourceSlack, SubmissionInProgress: true}
+
+	_, err := m.DestroyCluster(context.Background(), "U123", job.Name)
+	if toolErr := toolErrorFrom(t, err); toolErr.Code != ToolErrorCodeLaunchInitialization || !toolErr.Retryable {
+		t.Fatalf("error = %#v, want retryable LAUNCH_INITIALIZATION", toolErr)
+	}
+	if m.requests["U123"] == nil || m.jobs[job.Name].TerminationRequested {
+		t.Fatal("in-progress submission was released")
+	}
+}
+
+func TestTerminateJobForUserReleasesReservationWithoutProwJob(t *testing.T) {
+	m, _ := newLifecycleManager()
+	job := phantomLaunchJob("phantom", "U123", time.Now().Add(-time.Minute))
+	m.jobs[job.Name] = job
+	m.requests["U123"] = &JobRequest{User: "U123", Name: job.Name, Type: JobTypeInstall, RequestSource: requestSourceSlack}
+
+	message, err := m.TerminateJobForUser("U123")
+	if err != nil {
+		t.Fatalf("TerminateJobForUser returned error: %v", err)
+	}
+	if !strings.Contains(message, "you may now launch another") {
+		t.Fatalf("message = %q", message)
+	}
+	if _, ok := m.requests["U123"]; ok {
+		t.Fatal("reservation was not released")
+	}
+}
+
+func TestDestroyClusterClearsAccessAndShortensExpiry(t *testing.T) {
+	now := time.Now().UTC()
+	pj := lifecycleProwJob("cluster-ready", "U123", JobTypeLaunch, prowapiv1.PendingState, now.Add(-time.Minute))
+	m, _ := newLifecycleManager(pj)
+	m.jobs[pj.Name] = cachedLifecycleJob(pj.Name, "U123", now.Add(-time.Minute))
+
+	if _, err := m.DestroyCluster(context.Background(), "U123", pj.Name); err != nil {
+		t.Fatalf("DestroyCluster returned error: %v", err)
+	}
+	stored := m.jobs[pj.Name]
+	if stored.Credentials != "" || stored.CredentialsSnippet != "" || stored.ConsoleURL != "" || stored.APIURL != "" ||
+		stored.ConsoleUsername != "" || stored.ConsolePassword != "" || stored.AccessInstructions != "" || stored.RequestedChannel != "" {
+		t.Fatalf("access fields were not cleared: %#v", stored)
+	}
+	if remaining := time.Until(stored.ExpiresAt); remaining < 14*time.Minute || remaining > 15*time.Minute {
+		t.Fatalf("expiry is %s away, want about 15m", remaining)
+	}
+}
+
+func TestApplyAccessDetailsKeepsSlackCredentialsWhenStructuredParseFails(t *testing.T) {
+	kubeconfig := "apiVersion: v1\nkind: Config\nclusters:\n- name: c\n  cluster:\n    server: https://api.example:6443\n"
+	job := &Job{Name: "cluster", Platform: "aws"}
+	err := applyAccessDetails(job, kubeconfig, map[string][]byte{
+		"console.url":        []byte("https://console.example\n"),
+		"kubeadmin-password": []byte("secret\n"),
+	})
+	if err != nil {
+		t.Fatalf("applyAccessDetails returned error: %v", err)
+	}
+	if job.Credentials != kubeconfig {
+		t.Fatal("kubeconfig was dropped")
+	}
+	if !strings.HasPrefix(job.CredentialsSnippet, "https://console.example") || !strings.Contains(job.CredentialsSnippet, "`secret`") {
+		t.Fatalf("snippet = %q", job.CredentialsSnippet)
+	}
+	if job.ConsoleURL != "" || job.APIURL != "" || job.ConsoleUsername != "" || job.ConsolePassword != "" || job.AccessInstructions != "" {
+		t.Fatalf("structured fields set from an unparsable kubeconfig: %#v", job)
+	}
+
+	missing := &Job{Name: "cluster"}
+	if err := applyAccessDetails(missing, kubeconfig, map[string][]byte{}); err == nil {
+		t.Fatal("missing console URL did not return an error")
+	}
+	if missing.Credentials != kubeconfig {
+		t.Fatal("kubeconfig was dropped when the console URL was missing")
+	}
+}
+
+func TestGetClusterCredentialsWithoutStructuredAccess(t *testing.T) {
+	now := time.Now().UTC()
+	pj := lifecycleProwJob("cluster-ready", "U123", JobTypeLaunch, prowapiv1.PendingState, now.Add(-time.Minute))
+	m, _ := newLifecycleManager(pj)
+	job := cachedLifecycleJob(pj.Name, "U123", now.Add(-time.Minute))
+	job.ConsoleURL, job.APIURL, job.ConsoleUsername, job.ConsolePassword, job.AccessInstructions = "", "", "", "", ""
+	m.jobs[pj.Name] = job
+
+	_, err := m.GetClusterCredentials(context.Background(), "U123", pj.Name)
+	toolErr := toolErrorFrom(t, err)
+	if toolErr.Code != ToolErrorCodeCredentialsUnavailable || toolErr.Retryable || !strings.Contains(toolErr.Message, "access details are unavailable") {
+		t.Fatalf("error = %#v, want non-retryable access-unavailable error", toolErr)
 	}
 }

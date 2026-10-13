@@ -392,6 +392,20 @@ func TestManagerErrorMessageIsSanitized(t *testing.T) {
 	}
 }
 
+func TestLaunchInitializationMessageMatchesRetryability(t *testing.T) {
+	for _, retryable := range []bool{true, false} {
+		sanitized := sanitizeManagerToolError(manager.ToolError{
+			Code:      manager.ToolErrorCodeLaunchInitialization,
+			Message:   "internal detail",
+			Retryable: retryable,
+		})
+		retryAdvice := strings.Contains(sanitized.Message, "Retry with the same request_id")
+		if sanitized.Retryable != retryable || retryAdvice != retryable || strings.Contains(sanitized.Message, "internal detail") {
+			t.Fatalf("retryable=%v: sanitized error = %#v", retryable, sanitized)
+		}
+	}
+}
+
 func TestAllToolErrorsMatchTheirAdvertisedOutputSchemas(t *testing.T) {
 	tests := []struct {
 		name string
@@ -452,6 +466,36 @@ func TestConcurrentIdentityResolutionIsSafe(t *testing.T) {
 		})
 	}
 	wg.Wait()
+}
+
+func TestIdentityResolverCachesOnlyVerifiedUsers(t *testing.T) {
+	slackFake := newFakeSlack()
+	resolver := newIdentityResolver(slackFake)
+	for range 2 {
+		identity, err := resolver.resolve(context.Background(), "U123")
+		if err != nil || identity.UserName != "alice" {
+			t.Fatalf("resolve() = (%#v, %v), want alice", identity, err)
+		}
+	}
+	if slackFake.userCalls != 1 {
+		t.Fatalf("Slack user lookups = %d, want 1 within the cache TTL", slackFake.userCalls)
+	}
+
+	slackFake.user = &slack.User{ID: "U999", TeamID: "T123", Name: "bot", IsBot: true}
+	for range 2 {
+		if _, err := resolver.resolve(context.Background(), "U999"); err == nil {
+			t.Fatal("resolve() accepted a bot user")
+		}
+	}
+	slackFake.userErr = errors.New("slack unavailable")
+	for range 2 {
+		if _, err := resolver.resolve(context.Background(), "U777"); err == nil {
+			t.Fatal("resolve() succeeded while Slack was unavailable")
+		}
+	}
+	if slackFake.userCalls != 5 {
+		t.Fatalf("Slack user lookups = %d, want rejected and failed lookups repeated", slackFake.userCalls)
+	}
 }
 
 func connectForTest(t *testing.T, managerFake *fakeClusterManager, slackFake *fakeSlack, protocolVersion string) (*httptest.Server, *mcp.ClientSession) {

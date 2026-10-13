@@ -4,11 +4,17 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/openshift/ci-chat-bot/pkg/utils"
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/util/wait"
+	typedcorev1 "k8s.io/client-go/kubernetes/typed/core/v1"
 	"k8s.io/client-go/tools/cache"
 	prowapiv1 "sigs.k8s.io/prow/pkg/apis/prowjobs/v1"
 	prowfake "sigs.k8s.io/prow/pkg/client/clientset/versioned/fake"
@@ -323,5 +329,127 @@ func TestAcceptedLaunchNormalizesMonitorState(t *testing.T) {
 				t.Fatalf("monitor state = %q, want pending", worker.State)
 			}
 		})
+	}
+}
+
+// gatedProwJobLister hands each List call to the test, which decides whether
+// it fails.
+type gatedProwJobLister struct {
+	prowjoblister.ProwJobLister
+	calls chan chan error
+}
+
+func (l *gatedProwJobLister) ProwJobs(namespace string) prowjoblister.ProwJobNamespaceLister {
+	return gatedProwJobNamespaceLister{ProwJobNamespaceLister: l.ProwJobLister.ProwJobs(namespace), parent: l}
+}
+
+type gatedProwJobNamespaceLister struct {
+	prowjoblister.ProwJobNamespaceLister
+	parent *gatedProwJobLister
+}
+
+func (l gatedProwJobNamespaceLister) List(selector labels.Selector) ([]*prowapiv1.ProwJob, error) {
+	result := make(chan error)
+	l.parent.calls <- result
+	if err := <-result; err != nil {
+		return nil, err
+	}
+	return l.ProwJobNamespaceLister.List(selector)
+}
+
+// notFoundConfigMaps reports every ConfigMap as missing.
+type notFoundConfigMaps struct {
+	typedcorev1.ConfigMapInterface
+}
+
+func (notFoundConfigMaps) Get(_ context.Context, name string, _ metav1.GetOptions) (*corev1.ConfigMap, error) {
+	return nil, apierrors.NewNotFound(corev1.Resource("configmaps"), name)
+}
+
+func (m *jobManager) isLaunchReady() bool {
+	m.lock.RLock()
+	defer m.lock.RUnlock()
+	return m.launchReady
+}
+
+func TestRecoverLaunchesKeepsLaunchesBlockedUntilRecoverySucceeds(t *testing.T) {
+	m := newSyncTestManager(t)
+	lister := &gatedProwJobLister{ProwJobLister: m.prowLister, calls: make(chan chan error)}
+	m.prowLister = lister
+
+	recovered := make(chan struct{})
+	go m.recoverLaunches(wait.Backoff{Duration: time.Millisecond, Factor: 1, Steps: 10}, func() { close(recovered) })
+
+	for attempt := 1; attempt <= 3; attempt++ {
+		result := <-lister.calls
+		if err := m.launchRecoveryError(""); err == nil {
+			t.Fatalf("attempt %d: launches were admitted before recovery succeeded", attempt)
+		}
+		if attempt < 3 {
+			result <- errors.New("informer cache unavailable")
+		} else {
+			result <- nil
+		}
+	}
+	select {
+	case <-recovered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("recovery did not complete after sync succeeded")
+	}
+	if err := m.launchRecoveryError(""); err != nil {
+		t.Fatalf("launch blocked after recovery: %v", err)
+	}
+}
+
+func TestStartReturnsWithoutHypershiftConfigMap(t *testing.T) {
+	m := newSyncTestManager(t)
+	m.hiveConfigMapClient = notFoundConfigMaps{}
+	if err := m.updateHypershiftSupportedVersions(); !apierrors.IsNotFound(err) {
+		t.Fatalf("updateHypershiftSupportedVersions() error = %v, want NotFound", err)
+	}
+	var loopsStarted atomic.Bool
+	m.startBackgroundLoops = func() { loopsStarted.Store(true) }
+
+	if err := m.Start(); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	if !loopsStarted.Load() {
+		t.Fatal("Start() did not start the background loops")
+	}
+	deadline := time.After(5 * time.Second)
+	for !m.isLaunchReady() {
+		select {
+		case <-deadline:
+			t.Fatal("launch recovery did not complete")
+		case <-time.After(time.Millisecond):
+		}
+	}
+}
+
+func TestSyncMonitorsPendingMCEJob(t *testing.T) {
+	now := time.Now().UTC()
+	pending := syncTestProwJob("mce-pending", "U123", now.Add(-time.Minute))
+	pending.Annotations["ci-chat-bot.openshift.io/managedClusterName"] = "managed-a"
+	succeeded := syncTestProwJob("mce-succeeded", "U456", now.Add(-time.Minute))
+	succeeded.Annotations["ci-chat-bot.openshift.io/managedClusterName"] = "managed-b"
+	succeeded.Status.State = prowapiv1.SuccessState
+	m := newSyncTestManager(t, pending, succeeded)
+
+	actions, err := m.reconcileProwJobs()
+	if err != nil {
+		t.Fatalf("reconcileProwJobs() error = %v", err)
+	}
+	if len(actions.monitor) != 1 || actions.monitor[0].Name != pending.Name || actions.monitor[0].ManagedClusterName != "managed-a" {
+		t.Fatalf("monitored jobs = %#v, want only the pending MCE job", actions.monitor)
+	}
+	if len(actions.finished) != 0 {
+		t.Fatalf("finished jobs = %#v, want none for a successful MCE job", actions.finished)
+	}
+	mceNames := map[string]bool{}
+	for _, entry := range actions.mce {
+		mceNames[entry.job.Name] = true
+	}
+	if len(mceNames) != 2 || !mceNames[pending.Name] || !mceNames[succeeded.Name] {
+		t.Fatalf("MCE follow-up jobs = %v, want both MCE jobs", mceNames)
 	}
 }

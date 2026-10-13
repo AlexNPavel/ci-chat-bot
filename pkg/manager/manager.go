@@ -32,7 +32,6 @@ import (
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
-	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/wait"
 
@@ -303,37 +302,81 @@ func (m *jobManager) updateRosaVersions() error {
 	return nil
 }
 
+// launchRecoveryBackoff paces startup recovery retries: 10s, growing to 2m.
+var launchRecoveryBackoff = wait.Backoff{Duration: 10 * time.Second, Factor: 2, Jitter: 0.1, Steps: 10, Cap: 2 * time.Minute}
+
+// Start begins background work and returns immediately. Launch admission
+// stays closed until recoverLaunches has rebuilt the Prow and ROSA inventory;
+// all other commands are available at once.
 func (m *jobManager) Start() error {
 	m.lock.Lock()
 	m.started = time.Now()
 	m.launchReady = false
 	m.lock.Unlock()
 
-	if err := m.updateHypershiftSupportedVersions(); err != nil {
-		return fmt.Errorf("unable to initialize supported HyperShift releases: %w", err)
+	go m.recoverLaunches(launchRecoveryBackoff, m.startSyncLoops)
+	if m.startBackgroundLoops != nil {
+		m.startBackgroundLoops()
+	} else {
+		m.runBackgroundLoops()
 	}
-	if err := m.sync(); err != nil {
-		return fmt.Errorf("unable to recover Prow launches before startup: %w", err)
-	}
-	if err := m.rosaSync(); err != nil {
-		return fmt.Errorf("unable to recover ROSA clusters before startup: %w", err)
+	return nil
+}
+
+// recoverLaunches retries the initial Prow and ROSA sync until both succeed,
+// then opens launch admission and calls afterRecovery. Each attempt runs both
+// syncs, so expiry and monitoring keep running while recovery is retried.
+func (m *jobManager) recoverLaunches(backoff wait.Backoff, afterRecovery func()) {
+	for {
+		err := m.sync()
+		if err != nil {
+			err = fmt.Errorf("unable to recover Prow launches: %w", err)
+		} else if err = m.rosaSync(); err != nil {
+			err = fmt.Errorf("unable to recover ROSA clusters: %w", err)
+		}
+		if err == nil {
+			break
+		}
+		delay := backoff.Step()
+		klog.Warningf("Cluster launch recovery failed, launches stay disabled; retrying in %s: %v", delay.Round(time.Second), err)
+		time.Sleep(delay)
 	}
 	m.lock.Lock()
 	m.launchReady = true
 	m.lock.Unlock()
+	klog.Infof("Cluster launch recovery complete; launches are enabled")
+	if afterRecovery != nil {
+		afterRecovery()
+	}
+}
 
-	go wait.Forever(func() {
-		if err := m.sync(); err != nil {
-			klog.Infof("error during sync: %v", err)
-			return
-		}
-	}, time.Minute*5)
-	go wait.Forever(func() {
-		if err := m.rosaSync(); err != nil {
-			klog.Infof("error during rosa sync: %v", err)
-			return
-		}
-	}, time.Minute)
+// startSyncLoops starts the periodic Prow and ROSA syncs once recovery has
+// run them. The first periodic run waits one interval, so sync side effects
+// such as MCE imageset creation never run twice back to back.
+func (m *jobManager) startSyncLoops() {
+	go func() {
+		time.Sleep(5 * time.Minute)
+		wait.Forever(func() {
+			if err := m.sync(); err != nil {
+				klog.Infof("error during sync: %v", err)
+				return
+			}
+		}, time.Minute*5)
+	}()
+	go func() {
+		time.Sleep(time.Minute)
+		wait.Forever(func() {
+			if err := m.rosaSync(); err != nil {
+				klog.Infof("error during rosa sync: %v", err)
+				return
+			}
+		}, time.Minute)
+	}()
+}
+
+// runBackgroundLoops starts the periodic jobs that do not depend on launch
+// recovery.
+func (m *jobManager) runBackgroundLoops() {
 	go wait.Forever(func() {
 		if err := m.mceSync(); err != nil {
 			klog.Infof("error during mce sync: %v", err)
@@ -360,7 +403,6 @@ func (m *jobManager) Start() error {
 			klog.Warningf("error during gcpAccessCleanup: %v", err)
 		}
 	}, time.Hour)
-	return nil
 }
 
 func paramsToString(params map[string]string) string {
@@ -698,11 +740,12 @@ func (m *jobManager) rosaSync() error {
 	m.rosaClusters.lock.RLock()
 
 	var deletedEntries []string
-	var awsCleanupErrors []error
 	for _, id := range toDelete {
 		if err := m.removeAssociatedAWSResources(id); err != nil {
-			// removeAssociatedAWSResources records error metrics itself
-			awsCleanupErrors = append(awsCleanupErrors, err)
+			// removeAssociatedAWSResources records error metrics itself. The
+			// inventory is already rebuilt, so the entry is retried on the next
+			// sync instead of failing recovery.
+			klog.Errorf("Failed to remove AWS resources for stale ROSA cluster %s: %v", id, err)
 		} else {
 			deletedEntries = append(deletedEntries, id)
 		}
@@ -721,7 +764,7 @@ func (m *jobManager) rosaSync() error {
 		}
 	}
 
-	return utilerrors.NewAggregate(awsCleanupErrors)
+	return nil
 }
 
 func (m *jobManager) SetNotifier(fn JobCallbackFunc) {
@@ -1506,20 +1549,11 @@ func (m *jobManager) resolveAsPullRequestWithContext(ctx context.Context, spec s
 		owner = pr.User.Login
 	}
 
-	baseRefSHA := pr.Base.SHA
-	if baseRefSHA == "" {
-		if contextual, ok := m.githubClient.(interface {
-			GetRefWithContext(context.Context, string, string, string) (string, error)
-		}); ok {
-			baseRefSHA, err = contextual.GetRefWithContext(ctx, url.PathEscape(locationParts[0]), url.PathEscape(locationParts[1]), "heads/"+pr.Base.Ref)
-		} else if ctxErr := ctx.Err(); ctxErr != nil {
-			return nil, ctxErr
-		} else {
-			baseRefSHA, err = m.githubClient.GetRef(url.PathEscape(locationParts[0]), url.PathEscape(locationParts[1]), "heads/"+pr.Base.Ref)
-		}
-		if err != nil {
-			return nil, fmt.Errorf("unable to lookup pull request ref: %v", err)
-		}
+	// Always build against the current base-branch tip, as the Slack path
+	// always has. The pull request's recorded base commit can be stale.
+	baseRefSHA, err := m.githubClient.GetRefWithContext(ctx, url.PathEscape(locationParts[0]), url.PathEscape(locationParts[1]), "heads/"+pr.Base.Ref)
+	if err != nil {
+		return nil, fmt.Errorf("unable to lookup pull request ref: %v", err)
 	}
 
 	return &prowapiv1.Refs{
@@ -1537,6 +1571,17 @@ func (m *jobManager) resolveAsPullRequestWithContext(ctx context.Context, spec s
 			},
 		},
 	}, nil
+}
+
+// defaultJobName sets the request time and the time-based job name when the
+// request does not already have them.
+func (m *jobManager) defaultJobName(req *JobRequest) {
+	if req.RequestedAt.IsZero() {
+		req.RequestedAt = time.Now()
+	}
+	if req.Name == "" {
+		req.Name = fmt.Sprintf("%s%s", m.clusterPrefix, req.RequestedAt.UTC().Format("2006-01-02-150405.9999"))
+	}
 }
 
 func (m *jobManager) resolveToJob(req *JobRequest) (*Job, error) {
@@ -1561,14 +1606,8 @@ func (m *jobManager) resolveToJobWithContext(ctx context.Context, req *JobReques
 		}
 	}
 
-	if req.RequestedAt.IsZero() {
-		req.RequestedAt = time.Now()
-	}
+	m.defaultJobName(req)
 	name := req.Name
-	if name == "" {
-		name = fmt.Sprintf("%s%s", m.clusterPrefix, req.RequestedAt.UTC().Format("2006-01-02-150405.9999"))
-		req.Name = name
-	}
 
 	job := &Job{
 		OriginalMessage: req.OriginalMessage,
@@ -1994,60 +2033,10 @@ func (m *jobManager) launchJobForUserLegacy(req *JobRequest) (string, error) {
 		return "", err
 	}
 
-	// try to pick a job that matches the install version, if we can, otherwise use the first that
-	// matches us (we can do better)
-	var prowJob *prowapiv1.ProwJob
-	jobType := JobTypeLaunch
-	if req.Type == JobTypeWorkflowUpgrade {
-		jobType = JobTypeUpgrade
+	if err := selectLaunchJob(context.Background(), m, req, job); err != nil {
+		return "", err
 	}
-	selector := labels.Set{"job-env": req.Platform, "job-type": jobType, "job-architecture": req.Architecture} // TODO: handle versioned variants better
-	if len(job.Inputs[0].Version) > 0 {
-		if v, err := semver.ParseTolerant(job.Inputs[0].Version); err == nil {
-			withRelease := labels.Merge(selector, labels.Set{"job-release": fmt.Sprintf("%d.%d", v.Major, v.Minor)})
-			prowJob, _ = prow.JobForLabels(m.prowConfigLoader, labels.SelectorFromSet(withRelease))
-		}
-	}
-
-	if prowJob == nil {
-		architectureLabel := req.Architecture
-		// multiarch image launches use amd64 jobs
-		if architectureLabel == "multi" {
-			architectureLabel = "amd64"
-		}
-		selector := labels.Set{"job-env": req.Platform, "job-type": JobTypeLaunch, "config-type": "modern", "job-architecture": architectureLabel} // these jobs will only contain configs using non-deprecated features
-		prowJob, _ = prow.JobForLabels(m.prowConfigLoader, labels.SelectorFromSet(selector))
-		if prowJob != nil {
-			if sourceEnv, _, ok := firstEnvVar(prowJob.Spec.PodSpec, "UNRESOLVED_CONFIG"); ok { // all multistage configs will be unresolved
-				configHasVariant, _, err := configContainsVariant(req.JobParams, req.Platform, sourceEnv.Value, job.Mode)
-				if err != nil {
-					return "", err
-				}
-				// if the config does not contain the wanted variant, reset prowjob to cause configuration error
-				if !configHasVariant {
-					prowJob = nil
-				}
-			}
-		}
-	}
-	if prowJob == nil {
-		return "", fmt.Errorf("configuration error, unable to find prow job matching %s with parameters=%v", selector, paramsToString(job.JobParams))
-	}
-	job.JobName = prowJob.Spec.Job
-	job.BuildCluster, err = m.schedule(prowJob)
-	if err != nil {
-		klog.Error(err.Error())
-		job.BuildCluster = prowJob.Spec.Cluster
-	}
-
 	klog.Infof("Job %q requested by user %q with mode %s prow job %s(%s) - params=%s, inputs=%#v", job.Name, req.User, job.Mode, job.JobName, job.BuildCluster, paramsToString(job.JobParams), job.Inputs)
-
-	// Delegate account dispersement to Test Platform via the platform's
-	// cluster-profile set, which randomly selects an underlying account at
-	// runtime. Non-amd64 launches keep the default per-platform profile.
-	if req.Architecture == "amd64" {
-		job.CloudProfileSet = platformProfileSets[req.Platform]
-	}
 
 	msg, err := func() (string, error) {
 		m.lock.Lock()
@@ -2295,13 +2284,7 @@ func (m *jobManager) jobIsComplete(job *Job) bool {
 		job.Failure = current.Failure
 		job.ExpiresAt = current.ExpiresAt
 		if current.TerminationRequested || current.Complete || isTerminalProwState(current.State) {
-			job.Credentials = ""
-			job.CredentialsSnippet = ""
-			job.ConsoleURL = ""
-			job.APIURL = ""
-			job.ConsoleUsername = ""
-			job.ConsolePassword = ""
-			job.AccessInstructions = ""
+			clearJobAccess(job)
 		}
 		return true
 	}
@@ -2392,13 +2375,7 @@ func (m *jobManager) tryFinishedJob(job Job) bool {
 		}
 	}
 	if job.TerminationRequested {
-		job.Credentials = ""
-		job.CredentialsSnippet = ""
-		job.ConsoleURL = ""
-		job.APIURL = ""
-		job.ConsoleUsername = ""
-		job.ConsolePassword = ""
-		job.AccessInstructions = ""
+		clearJobAccess(&job)
 		job.RequestedChannel = ""
 	}
 
@@ -2784,10 +2761,6 @@ func (m *jobManager) LookupRosaInputs(versionPrefix string) (string, error) {
 	} else {
 		return fmt.Sprintf("Found the following version with a prefix of `%s`: %v", versionPrefix, matchedVersions), nil
 	}
-}
-
-func (m *jobManager) schedule(pj *prowapiv1.ProwJob) (string, error) {
-	return m.scheduleWithContext(context.Background(), pj)
 }
 
 func (m *jobManager) scheduleWithContext(ctx context.Context, pj *prowapiv1.ProwJob) (string, error) {

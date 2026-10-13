@@ -18,18 +18,46 @@ type recoveredProwJob struct {
 	job     *Job
 }
 
-// sync reconstructs manager state from the durable ProwJob records. Conversion
-// and scheduling happen before taking m.lock so a slow scheduler cannot block
-// admissions or monitor updates.
+// syncActions is the follow-up work found by reconcileProwJobs. It runs after
+// m.lock has been released.
+type syncActions struct {
+	monitor  []Job
+	finished []Job
+	mce      []recoveredProwJob
+}
+
+// sync reconstructs manager state from the durable ProwJob records and starts
+// monitors and completion handling for the jobs that need them.
 func (m *jobManager) sync() error {
+	actions, err := m.reconcileProwJobs()
+	if err != nil {
+		return err
+	}
+	for _, job := range actions.monitor {
+		go m.handleJobStartup(job, "sync")
+	}
+	for _, job := range actions.finished {
+		go m.finishedJob(job)
+	}
+	for _, entry := range actions.mce {
+		m.syncMCEProwJob(entry.prowJob, entry.job)
+	}
+	return nil
+}
+
+// reconcileProwJobs updates the job and request maps from the ProwJob lister.
+// Conversion and scheduling happen before taking m.lock so a slow scheduler
+// cannot block admissions or monitor updates.
+func (m *jobManager) reconcileProwJobs() (syncActions, error) {
+	var actions syncActions
 	if m.prowLister == nil {
-		return fmt.Errorf("ProwJob lister is unavailable")
+		return actions, fmt.Errorf("ProwJob lister is unavailable")
 	}
 	prowjobs, err := m.prowLister.ProwJobs(m.prowNamespace).List(labels.SelectorFromSet(labels.Set{
 		utils.LaunchLabel: "true",
 	}))
 	if err != nil {
-		return err
+		return actions, err
 	}
 
 	now := time.Now()
@@ -96,9 +124,6 @@ func (m *jobManager) sync() error {
 		m.requests = make(map[string]*JobRequest)
 	}
 
-	var monitorJobs []Job
-	var finishedJobs []Job
-	var mceJobs []recoveredProwJob
 	for _, entry := range entries {
 		job := entry.job
 		previous := cloneJob(m.jobs[job.Name])
@@ -132,17 +157,19 @@ func (m *jobManager) sync() error {
 
 		m.jobs[job.Name] = cloneJob(job)
 		if job.ManagedClusterName != "" {
-			mceJobs = append(mceJobs, entry)
-			continue
+			// MCE imageset jobs also get the ordinary monitor and completion
+			// handling, except that success is handled by syncMCEProwJob.
+			actions.mce = append(actions.mce, entry)
 		}
 		if isTerminalProwState(job.State) {
-			if !job.TerminationRequested && (previous == nil || previous.State != job.State) && job.State != prowapiv1.AbortedState {
-				finishedJobs = append(finishedJobs, *cloneJob(job))
+			successfulMCE := job.ManagedClusterName != "" && job.State == prowapiv1.SuccessState
+			if !job.TerminationRequested && !successfulMCE && (previous == nil || previous.State != job.State) && job.State != prowapiv1.AbortedState {
+				actions.finished = append(actions.finished, *cloneJob(job))
 			}
 			continue
 		}
 		if !job.TerminationRequested && (previous == nil || previous.State != job.State || !previous.IsComplete()) {
-			monitorJobs = append(monitorJobs, *cloneJob(job))
+			actions.monitor = append(actions.monitor, *cloneJob(job))
 		}
 	}
 
@@ -168,17 +195,7 @@ func (m *jobManager) sync() error {
 	}
 	klog.Infof("Job sync complete, %d jobs and %d requests", len(m.jobs), len(m.requests))
 	m.lock.Unlock()
-
-	for _, job := range monitorJobs {
-		go m.handleJobStartup(job, "sync")
-	}
-	for _, job := range finishedJobs {
-		go m.finishedJob(job)
-	}
-	for _, entry := range mceJobs {
-		m.syncMCEProwJob(entry.prowJob, entry.job)
-	}
-	return nil
+	return actions, nil
 }
 
 // jobCacheExpired keeps completed jobs briefly for reporting without retaining

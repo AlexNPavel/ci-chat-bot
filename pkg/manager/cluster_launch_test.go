@@ -549,3 +549,34 @@ func TestSubmitClusterDMFailureRollsBackOnlyItsReservation(t *testing.T) {
 		t.Fatalf("failed pre-submission request left state: requests=%#v jobs=%#v creates=%d", f.manager.requests, f.manager.jobs, f.createCount.Load())
 	}
 }
+
+func TestSelectLaunchJob(t *testing.T) {
+	tests := []struct {
+		name             string
+		architecture     string
+		wantProfileSet   string
+		wantBuildCluster string
+	}{
+		{name: "multi falls back to the amd64 launch job", architecture: "multi", wantBuildCluster: "build-cluster"},
+		{name: "amd64 uses the platform profile set", architecture: "amd64", wantProfileSet: "openshift-org-aws", wantBuildCluster: "build-cluster"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := newClusterLaunchFixture(1)
+			req := &JobRequest{Type: JobTypeInstall, Platform: "aws", Architecture: tt.architecture}
+			job := &Job{Mode: JobTypeLaunch, Inputs: []JobInput{{Version: "4.18.2"}}}
+			if err := selectLaunchJob(context.Background(), f.manager, req, job); err != nil {
+				t.Fatalf("selectLaunchJob() error = %v", err)
+			}
+			if job.JobName != "periodic-launch" || job.BuildCluster != tt.wantBuildCluster || job.CloudProfileSet != tt.wantProfileSet {
+				t.Fatalf("job = (%q, %q, %q), want (periodic-launch, %q, %q)", job.JobName, job.BuildCluster, job.CloudProfileSet, tt.wantBuildCluster, tt.wantProfileSet)
+			}
+		})
+	}
+
+	f := newClusterLaunchFixture(1)
+	err := selectLaunchJob(context.Background(), f.manager, &JobRequest{Type: JobTypeInstall, Platform: "gcp", Architecture: "amd64"}, &Job{Mode: JobTypeLaunch, Inputs: []JobInput{{Version: "4.18.2"}}})
+	if err == nil || !strings.Contains(err.Error(), "unable to find prow job") {
+		t.Fatalf("selectLaunchJob() error = %v, want a configuration error", err)
+	}
+}

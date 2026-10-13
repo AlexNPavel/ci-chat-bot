@@ -331,6 +331,27 @@ func isAmbiguousProwCreateError(err error) bool {
 	return errors.As(err, &statusErr) && statusErr.ErrStatus.Code >= 500
 }
 
+// classifyLaunchPreparationError maps an error from preparing or submitting a
+// launch to a ToolError. Cancellation and transient backend failures are
+// retryable with the same request ID. Anything else is reported with
+// fallbackCode and is not retryable, because the same request would fail again.
+func classifyLaunchPreparationError(ctx context.Context, err error, name, fallbackCode string) *ToolError {
+	if ctx != nil && ctx.Err() != nil {
+		return &ToolError{Code: ToolErrorCodeLaunchInitialization, Message: "The launch is still being initialized. Retry with the same request ID.", Retryable: true, JobID: name}
+	}
+	if isAmbiguousProwCreateError(err) {
+		return &ToolError{Code: ToolErrorCodeBackendUnavailable, Message: "A launch dependency is temporarily unavailable. Retry with the same request ID.", Retryable: true, JobID: name}
+	}
+	message := strings.ToLower(err.Error())
+	if strings.Contains(message, "unable to lookup") || strings.Contains(message, "url resolve failed") || strings.Contains(message, "failed to get ocp release") {
+		return &ToolError{Code: ToolErrorCodeBackendUnavailable, Message: "A launch dependency is temporarily unavailable. Retry with the same request ID.", Retryable: true, JobID: name}
+	}
+	if fallbackCode == ToolErrorCodeInvalidArguments {
+		return &ToolError{Code: fallbackCode, Message: err.Error(), Retryable: false, JobID: name}
+	}
+	return &ToolError{Code: fallbackCode, Message: "Prow could not start the cluster launch.", Retryable: false, JobID: name}
+}
+
 func directProwJobReadContext(parent context.Context) (context.Context, context.CancelFunc) {
 	if parent == nil {
 		parent = context.Background()
@@ -397,13 +418,9 @@ func normalizeJobRequestOptions(req *JobRequest) error {
 	return nil
 }
 
+// prepareProwLaunch resolves a validated and normalized launch request into a
+// Job with its Prow job definition and build cluster selected.
 func prepareProwLaunch(ctx context.Context, m *jobManager, req *JobRequest) (*Job, error) {
-	if err := validateLaunchInputs(req); err != nil {
-		return nil, err
-	}
-	if err := normalizeJobRequestOptions(req); err != nil {
-		return nil, err
-	}
 	job, err := m.resolveToJobWithContext(ctx, req)
 	if err != nil {
 		return nil, err
@@ -411,12 +428,20 @@ func prepareProwLaunch(ctx context.Context, m *jobManager, req *JobRequest) (*Jo
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	if err := selectLaunchJob(ctx, m, req, job); err != nil {
+		return nil, err
+	}
+	return job, nil
+}
 
+// selectLaunchJob picks the Prow job definition for a cluster launch, preferring
+// one for the requested release, and schedules it onto a build cluster.
+func selectLaunchJob(ctx context.Context, m *jobManager, req *JobRequest, job *Job) error {
 	jobType := JobTypeLaunch
 	if req.Type == JobTypeWorkflowUpgrade {
 		jobType = JobTypeUpgrade
 	}
-	selector := labels.Set{"job-env": req.Platform, "job-type": string(jobType), "job-architecture": req.Architecture}
+	selector := labels.Set{"job-env": req.Platform, "job-type": string(jobType), "job-architecture": req.Architecture} // TODO: handle versioned variants better
 	var prowJob *prowapiv1.ProwJob
 	if len(job.Inputs[0].Version) > 0 {
 		if version, parseErr := semver.ParseTolerant(job.Inputs[0].Version); parseErr == nil {
@@ -426,17 +451,21 @@ func prepareProwLaunch(ctx context.Context, m *jobManager, req *JobRequest) (*Jo
 	}
 	if prowJob == nil {
 		architectureLabel := req.Architecture
+		// multiarch image launches use amd64 jobs
 		if architectureLabel == "multi" {
 			architectureLabel = "amd64"
 		}
+		// these jobs will only contain configs using non-deprecated features
 		modernSelector := labels.Set{"job-env": req.Platform, "job-type": JobTypeLaunch, "config-type": "modern", "job-architecture": architectureLabel}
 		prowJob, _ = prow.JobForLabels(m.prowConfigLoader, labels.SelectorFromSet(modernSelector))
 		if prowJob != nil {
+			// all multistage configs will be unresolved
 			if sourceEnv, _, ok := firstEnvVar(prowJob.Spec.PodSpec, "UNRESOLVED_CONFIG"); ok {
 				configHasVariant, _, variantErr := configContainsVariant(req.JobParams, req.Platform, sourceEnv.Value, job.Mode)
 				if variantErr != nil {
-					return nil, variantErr
+					return variantErr
 				}
+				// if the config does not contain the wanted variant, reset prowjob to cause configuration error
 				if !configHasVariant {
 					prowJob = nil
 				}
@@ -444,21 +473,25 @@ func prepareProwLaunch(ctx context.Context, m *jobManager, req *JobRequest) (*Jo
 		}
 	}
 	if prowJob == nil {
-		return nil, fmt.Errorf("configuration error, unable to find prow job matching %s with parameters=%v", selector, paramsToString(job.JobParams))
+		return fmt.Errorf("configuration error, unable to find prow job matching %s with parameters=%v", selector, paramsToString(job.JobParams))
 	}
 	job.JobName = prowJob.Spec.Job
+	var err error
 	job.BuildCluster, err = m.scheduleWithContext(ctx, prowJob)
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			return nil, ctxErr
+			return ctxErr
 		}
 		klog.Error(err.Error())
 		job.BuildCluster = prowJob.Spec.Cluster
 	}
+	// Delegate account dispersement to Test Platform via the platform's
+	// cluster-profile set, which randomly selects an underlying account at
+	// runtime. Non-amd64 launches keep the default per-platform profile.
 	if req.Architecture == "amd64" {
 		job.CloudProfileSet = platformProfileSets[req.Platform]
 	}
-	return job, nil
+	return nil
 }
 
 func isLaunchRequestType(jobType JobType) bool {
@@ -907,19 +940,7 @@ func (m *jobManager) SubmitCluster(ctx context.Context, request ClusterLaunchReq
 
 	job, err := prepareProwLaunch(ctx, m, jobRequest)
 	if err != nil {
-		code := ToolErrorCodeInvalidArguments
-		message := err.Error()
-		retryable := false
-		if ctx.Err() != nil {
-			code = ToolErrorCodeLaunchInitialization
-			message = "The launch is still being initialized. Retry with the same request ID."
-			retryable = true
-		} else if strings.Contains(strings.ToLower(err.Error()), "unable to lookup") || strings.Contains(strings.ToLower(err.Error()), "url resolve failed") || strings.Contains(strings.ToLower(err.Error()), "failed to get ocp release") {
-			code = ToolErrorCodeBackendUnavailable
-			message = "A launch dependency is temporarily unavailable. Retry with the same request ID."
-			retryable = true
-		}
-		return LaunchResult{}, &ToolError{Code: code, Message: message, Retryable: retryable, JobID: name}
+		return LaunchResult{}, classifyLaunchPreparationError(ctx, err, name, ToolErrorCodeInvalidArguments)
 	}
 	job.RequestKeyHash = keyHash
 	job.InputFingerprint = fingerprint
@@ -992,7 +1013,7 @@ func (m *jobManager) SubmitCluster(ctx context.Context, request ClusterLaunchReq
 			reservationFinalized = true
 			return LaunchResult{}, &ToolError{Code: ToolErrorCodeLaunchInitialization, Message: "Prow may be processing the launch, but its status could not be verified. Retry with the same request ID.", Retryable: true, JobID: name}
 		}
-		return LaunchResult{}, &ToolError{Code: ToolErrorCodeLaunchInitialization, Message: "Prow could not start the cluster launch.", Retryable: false, JobID: name}
+		return LaunchResult{}, classifyLaunchPreparationError(ctx, createErr, name, ToolErrorCodeLaunchInitialization)
 	}
 
 	// A successful Create response is durable acceptance even if an immediate
@@ -1044,12 +1065,7 @@ func (m *jobManager) launchClusterForSlack(req *JobRequest) (string, error) {
 	if err := normalizeJobRequestOptions(request); err != nil {
 		return "", err
 	}
-	if request.RequestedAt.IsZero() {
-		request.RequestedAt = time.Now()
-	}
-	if request.Name == "" {
-		request.Name = fmt.Sprintf("%s%s", m.clusterPrefix, request.RequestedAt.UTC().Format("2006-01-02-150405.9999"))
-	}
+	m.defaultJobName(request)
 	request.RequestSource = requestSourceSlack
 	mode := launchModeForRequest(request.Type)
 	provisional := &Job{
@@ -1203,7 +1219,6 @@ func getPullRequestWithContext(ctx context.Context, client github.Client, org, r
 				Merged      githubv4.Boolean
 				Mergeable   githubv4.MergeableState
 				BaseRefName githubv4.String
-				BaseRefOid  githubv4.GitObjectID
 				HeadRefOid  githubv4.GitObjectID
 				Author      struct {
 					Login githubv4.String
@@ -1235,11 +1250,8 @@ func getPullRequestWithContext(ctx context.Context, client github.Client, org, r
 	return &github.PullRequest{
 		Merged:   merged,
 		Mergable: mergeable,
-		Base: github.PullRequestBranch{
-			Ref: string(query.Repository.PullRequest.BaseRefName),
-			SHA: string(query.Repository.PullRequest.BaseRefOid),
-		},
-		Head: github.PullRequestBranch{SHA: string(query.Repository.PullRequest.HeadRefOid)},
-		User: github.User{Login: string(query.Repository.PullRequest.Author.Login)},
+		Base:     github.PullRequestBranch{Ref: string(query.Repository.PullRequest.BaseRefName)},
+		Head:     github.PullRequestBranch{SHA: string(query.Repository.PullRequest.HeadRefOid)},
+		User:     github.User{Login: string(query.Repository.PullRequest.Author.Login)},
 	}, nil
 }

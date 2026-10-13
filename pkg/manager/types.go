@@ -279,6 +279,8 @@ type jobManager struct {
 	started              time.Time
 	launchReady          bool
 	recentStartEstimates []time.Duration
+	// startBackgroundLoops replaces runBackgroundLoops in tests.
+	startBackgroundLoops func()
 
 	clusterPrefix string
 	maxClusters   int

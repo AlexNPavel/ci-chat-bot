@@ -358,10 +358,17 @@ func sanitizeManagerToolError(value manager.ToolError) manager.ToolError {
 			Retryable: false,
 		}
 	}
+	if value.Code == manager.ToolErrorCodeLaunchInitialization && !value.Retryable {
+		message = launchInitializationPermanentMessage
+	}
 	value.Message = message
 	value.JobID = safeJobID(value.JobID)
 	return value
 }
+
+// launchInitializationPermanentMessage replaces the retry advice for launch
+// initialization failures that the same request would hit again.
+const launchInitializationPermanentMessage = "The launch could not be initialized. Check the request parameters before launching again."
 
 var safeToolErrorMessages = map[string]string{
 	manager.ToolErrorCodeInvalidArguments:       "One or more arguments are missing or invalid.",

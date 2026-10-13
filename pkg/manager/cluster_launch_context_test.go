@@ -2,12 +2,16 @@ package manager
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
 	"github.com/blang/semver"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/util/sets"
+	"sigs.k8s.io/prow/pkg/github"
 )
 
 type contextRecordingConfigResolver struct {
@@ -146,5 +150,73 @@ func TestBusyProwWorkerNeverConfirmsUntestedCreate(t *testing.T) {
 	}
 	if fixture.createCount.Load() != 0 {
 		t.Fatalf("Prow Create called %d times while another worker owned the key", fixture.createCount.Load())
+	}
+}
+
+// fakePullRequestGitHub answers the pull request GraphQL query and GetRef.
+type fakePullRequestGitHub struct {
+	github.Client
+	graphQLResponse string
+	baseTip         string
+	refs            []string
+}
+
+func (f *fakePullRequestGitHub) QueryWithGitHubAppsSupport(_ context.Context, q any, _ map[string]any, _ string) error {
+	return json.Unmarshal([]byte(f.graphQLResponse), q)
+}
+
+func (f *fakePullRequestGitHub) GetRefWithContext(_ context.Context, org, repo, ref string) (string, error) {
+	f.refs = append(f.refs, org+"/"+repo+":"+ref)
+	return f.baseTip, nil
+}
+
+func TestResolveAsPullRequestUsesBaseBranchTip(t *testing.T) {
+	client := &fakePullRequestGitHub{
+		graphQLResponse: `{"repository":{"pullRequest":{"merged":false,"mergeable":"MERGEABLE","baseRefName":"main","baseRefOid":"stale-pr-base","headRefOid":"head-sha","author":{"login":"author"}}}}`,
+		baseTip:         "branch-tip",
+	}
+	m := &jobManager{githubClient: client}
+
+	refs, err := m.resolveAsPullRequestWithContext(context.Background(), "openshift/installer#123")
+	if err != nil {
+		t.Fatalf("resolveAsPullRequestWithContext() error = %v", err)
+	}
+	if refs.BaseSHA != "branch-tip" {
+		t.Fatalf("BaseSHA = %q, want the base-branch tip", refs.BaseSHA)
+	}
+	if refs.BaseRef != "main" || len(refs.Pulls) != 1 || refs.Pulls[0].SHA != "head-sha" || refs.Pulls[0].Author != "author" {
+		t.Fatalf("refs = %#v", refs)
+	}
+	if len(client.refs) != 1 || client.refs[0] != "openshift/installer:heads/main" {
+		t.Fatalf("GetRef calls = %v", client.refs)
+	}
+}
+
+func TestClassifyLaunchPreparationError(t *testing.T) {
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	tests := []struct {
+		name          string
+		ctx           context.Context
+		err           error
+		fallback      string
+		wantCode      string
+		wantRetryable bool
+	}{
+		{name: "canceled request", ctx: canceled, err: errors.New("anything"), fallback: ToolErrorCodeInvalidArguments, wantCode: ToolErrorCodeLaunchInitialization, wantRetryable: true},
+		{name: "deadline", ctx: context.Background(), err: fmt.Errorf("load config: %w", context.DeadlineExceeded), fallback: ToolErrorCodeLaunchInitialization, wantCode: ToolErrorCodeBackendUnavailable, wantRetryable: true},
+		{name: "wrapped API timeout", ctx: context.Background(), err: fmt.Errorf("the launch job definition could not be loaded: %w", apierrors.NewTimeoutError("slow", 1)), fallback: ToolErrorCodeLaunchInitialization, wantCode: ToolErrorCodeBackendUnavailable, wantRetryable: true},
+		{name: "server error", ctx: context.Background(), err: fmt.Errorf("could not resolve config: %w", apierrors.NewInternalError(errors.New("boom"))), fallback: ToolErrorCodeLaunchInitialization, wantCode: ToolErrorCodeBackendUnavailable, wantRetryable: true},
+		{name: "known dependency message", ctx: context.Background(), err: errors.New("unable to lookup registry URL for job"), fallback: ToolErrorCodeLaunchInitialization, wantCode: ToolErrorCodeBackendUnavailable, wantRetryable: true},
+		{name: "missing configuration", ctx: context.Background(), err: errors.New("there is no defined configuration for the organization o with repo r and branch b"), fallback: ToolErrorCodeLaunchInitialization, wantCode: ToolErrorCodeLaunchInitialization},
+		{name: "invalid input", ctx: context.Background(), err: errors.New("configuration error, unable to find prow job"), fallback: ToolErrorCodeInvalidArguments, wantCode: ToolErrorCodeInvalidArguments},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := classifyLaunchPreparationError(tt.ctx, tt.err, "job", tt.fallback)
+			if got.Code != tt.wantCode || got.Retryable != tt.wantRetryable || got.JobID != "job" {
+				t.Fatalf("classifyLaunchPreparationError() = %#v, want code %s retryable %v", got, tt.wantCode, tt.wantRetryable)
+			}
+		})
 	}
 }
