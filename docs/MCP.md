@@ -166,6 +166,12 @@ and Chai connector:
 6. Confirm Chai obtains the user ID from trusted conversation context and
    preserves the request ID across retries.
 
+When testing locally through ngrok, start the tunnel with
+`ngrok http 8080 --host-header=rewrite`. The MCP SDK's DNS-rebinding protection
+rejects requests that reach a loopback listener with a non-loopback `Host`
+header, so `/mcp` returns 403 through an unmodified tunnel. Production is not
+affected because the bot does not listen on a loopback address there.
+
 Operation count and duration metrics use bounded tool and outcome labels. Audit
 events include principal, Slack user ID, job ID, request-key hash, operation, and
 outcome, without tokens or access secrets.

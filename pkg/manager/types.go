@@ -278,9 +278,12 @@ type jobManager struct {
 	jobs                 map[string]*Job
 	started              time.Time
 	launchReady          bool
+	rosaReady            bool
 	recentStartEstimates []time.Duration
 	// startBackgroundLoops replaces runBackgroundLoops in tests.
 	startBackgroundLoops func()
+	// finishedJobRetryDelay overrides the Prow verification retry delay in tests.
+	finishedJobRetryDelay time.Duration
 
 	clusterPrefix string
 	maxClusters   int

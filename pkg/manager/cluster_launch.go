@@ -19,7 +19,6 @@ import (
 	"github.com/blang/semver"
 	"github.com/openshift/ci-chat-bot/pkg/prow"
 	"github.com/openshift/ci-chat-bot/pkg/utils"
-	githubv4 "github.com/shurcooL/githubv4"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
@@ -286,8 +285,12 @@ func clusterJobFromProwJob(pj *prowapiv1.ProwJob) (*Job, error) {
 		job.ExpiresAt = job.RequestedAt.Add(3 * time.Hour)
 	}
 	switch pj.Status.State {
-	case prowapiv1.FailureState, prowapiv1.ErrorState, prowapiv1.AbortedState:
+	case prowapiv1.FailureState, prowapiv1.ErrorState:
 		job.Failure = "job failed, see logs"
+	case prowapiv1.AbortedState:
+		if !job.TerminationRequested {
+			job.Failure = "job aborted"
+		}
 	}
 	return job, nil
 }
@@ -539,23 +542,39 @@ func (m *jobManager) launchRecoveryError(jobID string) error {
 // reserveClusterSubmission applies user and global admission under one lock so
 // Slack and structured launches share the same reservation map and capacity.
 func (m *jobManager) reserveClusterSubmission(req *JobRequest, job *Job) (reserved bool, existingMessage string, err error) {
+	reserved, _, existingMessage, err = m.reserveClusterSubmissionWithPrior(req, job)
+	return reserved, existingMessage, err
+}
+
+// clusterReservation is a snapshot of a kept reservation, restored if a retry
+// that took it over fails before reaching Prow.
+type clusterReservation struct {
+	request *JobRequest
+	job     *Job
+}
+
+// reserveClusterSubmissionWithPrior is reserveClusterSubmission that also
+// returns the reservation it took over when retrying a request ID whose
+// earlier attempt was kept. A nil prior means this call created the
+// reservation.
+func (m *jobManager) reserveClusterSubmissionWithPrior(req *JobRequest, job *Job) (reserved bool, prior *clusterReservation, existingMessage string, err error) {
 	if req == nil || job == nil {
-		return false, "", fmt.Errorf("cluster launch request is incomplete")
+		return false, nil, "", fmt.Errorf("cluster launch request is incomplete")
 	}
 	m.lock.Lock()
 	defer m.lock.Unlock()
 
 	if !m.launchReady {
-		return false, "", &ToolError{Code: ToolErrorCodeLaunchInitialization, Message: "Cluster recovery is still in progress; retry shortly.", Retryable: true, JobID: job.Name}
+		return false, nil, "", &ToolError{Code: ToolErrorCodeLaunchInitialization, Message: "Cluster recovery is still in progress; retry shortly.", Retryable: true, JobID: job.Name}
 	}
 
 	activeCount, activeNames := activeClusterCountLocked(m)
 	if current := m.requests[req.User]; current != nil && req.RequestKeyHash != "" && current.RequestKeyHash == req.RequestKeyHash {
 		if current.InputFingerprint != req.InputFingerprint || current.RequestSource != req.RequestSource {
-			return false, "", &ToolError{Code: ToolErrorCodeRequestConflict, Message: "This request ID is already associated with a different launch request.", Retryable: false, JobID: job.Name}
+			return false, nil, "", &ToolError{Code: ToolErrorCodeRequestConflict, Message: "This request ID is already associated with a different launch request.", Retryable: false, JobID: job.Name}
 		}
 		if current.SubmissionInProgress {
-			return false, "", &ToolError{Code: ToolErrorCodeLaunchInitialization, Message: "The launch is still being initialized. Retry with the same request ID.", Retryable: true, JobID: job.Name}
+			return false, nil, "", &ToolError{Code: ToolErrorCodeLaunchInitialization, Message: "The launch is still being initialized. Retry with the same request ID.", Retryable: true, JobID: job.Name}
 		}
 		currentJob := m.jobs[job.Name]
 		if currentJob == nil || launchRequestFailure(currentJob) || (!currentJob.ExpiresAt.IsZero() && !time.Now().Before(currentJob.ExpiresAt)) {
@@ -566,12 +585,13 @@ func (m *jobManager) reserveClusterSubmission(req *JobRequest, job *Job) (reserv
 			activeCount, _ = activeClusterCountLocked(m)
 		} else {
 			if _, counted := activeNames[job.Name]; counted && activeCount-1 >= m.maxClusters {
-				return false, "", clusterCapacityAdmissionError(req, job.Name, m.jobs)
+				return false, nil, "", clusterCapacityAdmissionError(req, job.Name, m.jobs)
 			}
+			prior := &clusterReservation{request: cloneJobRequest(current), job: cloneJob(currentJob)}
 			requestCopy := cloneJobRequest(req)
 			requestCopy.SubmissionInProgress = true
 			m.requests[req.User] = requestCopy
-			return true, "", nil
+			return true, prior, "", nil
 		}
 	}
 
@@ -585,9 +605,9 @@ func (m *jobManager) reserveClusterSubmission(req *JobRequest, job *Job) (reserv
 			activeCount, _ = activeClusterCountLocked(m)
 		} else if isLaunchRequestType(current.Type) || isClusterLaunchMode(currentJobMode(currentJob)) {
 			if currentJob != nil && len(currentJob.Credentials) > 0 && req.RequestSource == requestSourceSlack {
-				return false, "your cluster is already running, see your credentials again with the 'auth' command", nil
+				return false, nil, "your cluster is already running, see your credentials again with the 'auth' command", nil
 			}
-			return false, "", m.activeClusterAdmissionError(req, job.Name, current)
+			return false, nil, "", m.activeClusterAdmissionError(req, job.Name, current)
 		}
 	}
 
@@ -596,23 +616,23 @@ func (m *jobManager) reserveClusterSubmission(req *JobRequest, job *Job) (reserv
 			continue
 		}
 		if len(currentJob.Credentials) > 0 && req.RequestSource == requestSourceSlack {
-			return false, "your cluster is already running, see your credentials again with the 'auth' command", nil
+			return false, nil, "your cluster is already running, see your credentials again with the 'auth' command", nil
 		}
 		if currentJob.Name == job.Name && currentJob.RequestKeyHash == req.RequestKeyHash && currentJob.InputFingerprint == req.InputFingerprint {
 			continue
 		}
-		return false, "", m.activeClusterAdmissionError(req, job.Name, nil)
+		return false, nil, "", m.activeClusterAdmissionError(req, job.Name, nil)
 	}
 
 	if activeCount >= m.maxClusters {
-		return false, "", clusterCapacityAdmissionError(req, job.Name, m.jobs)
+		return false, nil, "", clusterCapacityAdmissionError(req, job.Name, m.jobs)
 	}
 
 	requestCopy := cloneJobRequest(req)
 	requestCopy.SubmissionInProgress = true
 	m.requests[req.User] = requestCopy
 	m.jobs[job.Name] = cloneJob(job)
-	return true, "", nil
+	return true, nil, "", nil
 }
 
 func activeClusterCountLocked(m *jobManager) (int, map[string]struct{}) {
@@ -697,6 +717,24 @@ func (m *jobManager) rollbackClusterReservation(req *JobRequest) {
 	}
 	if current := m.jobs[req.Name]; current != nil && current.RequestedBy == req.User && current.RequestKeyHash == req.RequestKeyHash && current.InputFingerprint == req.InputFingerprint && current.RequestSource == req.RequestSource {
 		delete(m.jobs, req.Name)
+	}
+}
+
+// restoreClusterReservation puts back a kept reservation that a failed retry
+// took over, instead of deleting it as rollbackClusterReservation would.
+func (m *jobManager) restoreClusterReservation(req *JobRequest, prior *clusterReservation) {
+	if req == nil || prior == nil {
+		return
+	}
+	m.lock.Lock()
+	defer m.lock.Unlock()
+	if current := m.requests[req.User]; matchesClusterReservation(current, req) {
+		restored := cloneJobRequest(prior.request)
+		restored.SubmissionInProgress = false
+		m.requests[req.User] = restored
+	}
+	if current := m.jobs[req.Name]; prior.job != nil && (current == nil || current.RequestedBy == req.User && current.RequestKeyHash == req.RequestKeyHash) {
+		m.jobs[req.Name] = cloneJob(prior.job)
 	}
 }
 
@@ -911,7 +949,7 @@ func (m *jobManager) SubmitCluster(ctx context.Context, request ClusterLaunchReq
 		InputFingerprint: fingerprint,
 		RequestSource:    requestSourceMCP,
 	}
-	reserved, _, err := m.reserveClusterSubmission(jobRequest, provisional)
+	reserved, prior, _, err := m.reserveClusterSubmissionWithPrior(jobRequest, provisional)
 	if err != nil {
 		return LaunchResult{}, err
 	}
@@ -921,7 +959,14 @@ func (m *jobManager) SubmitCluster(ctx context.Context, request ClusterLaunchReq
 
 	reservationFinalized := false
 	defer func() {
-		if !reservationFinalized {
+		if reservationFinalized {
+			return
+		}
+		// A retry that took over a reservation kept by an earlier ambiguous
+		// attempt must not delete it; that ProwJob may still appear.
+		if prior != nil {
+			m.restoreClusterReservation(jobRequest, prior)
+		} else {
 			m.rollbackClusterReservation(jobRequest)
 		}
 	}()
@@ -1031,6 +1076,7 @@ func (m *jobManager) SubmitCluster(ctx context.Context, request ClusterLaunchReq
 	}
 	if acceptedProwJob != nil {
 		if _, err := validateDurableClusterJob(acceptedProwJob, jobRequest.User, keyHash, fingerprint); err != nil {
+			m.updateClusterReservation(jobRequest, submissionJob, false)
 			reservationFinalized = true
 			return LaunchResult{}, err
 		}
@@ -1133,9 +1179,14 @@ func (m *jobManager) launchClusterForSlack(req *JobRequest) (string, error) {
 				} else {
 					reservationFinalized = true
 				}
+			} else if !accepted && apierrors.IsNotFound(readErr) {
+				// Prow definitively has no job, so release the reservation and
+				// let the user launch again.
+				return "", fmt.Errorf("the requested job cannot be started: %v", createErr)
 			} else {
 				m.updateClusterReservation(request, submissionJob, false)
 				reservationFinalized = true
+				return "", fmt.Errorf("%v; if the cluster does not appear shortly, run `done` to clear this request", createErr)
 			}
 			return "", createErr
 		}
@@ -1202,56 +1253,19 @@ func legacyClusterStartedMessage(job *Job, prowJobURL string) string {
 	return msg
 }
 
-type pullRequestContextClient interface {
-	GetPullRequestWithContext(ctx context.Context, org, repo string, number int) (*github.PullRequest, error)
-}
-
+// getPullRequestWithContext looks up a pull request through the REST API. The
+// vendored client has no context-aware variant, so cancellation is checked
+// before and after the call.
 func getPullRequestWithContext(ctx context.Context, client github.Client, org, repo string, number int) (*github.PullRequest, error) {
-	if contextual, ok := client.(pullRequestContextClient); ok {
-		return contextual.GetPullRequestWithContext(ctx, org, repo, number)
-	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	var query struct {
-		Repository struct {
-			PullRequest struct {
-				Merged      githubv4.Boolean
-				Mergeable   githubv4.MergeableState
-				BaseRefName githubv4.String
-				HeadRefOid  githubv4.GitObjectID
-				Author      struct {
-					Login githubv4.String
-				}
-			} `graphql:"pullRequest(number: $number)"`
-		} `graphql:"repository(owner: $owner, name: $repo)"`
-	}
-	variables := map[string]any{
-		"owner":  githubv4.String(org),
-		"repo":   githubv4.String(repo),
-		"number": githubv4.Int(number),
-	}
-	if err := client.QueryWithGitHubAppsSupport(ctx, &query, variables, org); err != nil {
+	pr, err := client.GetPullRequest(org, repo, number)
+	if err != nil {
 		return nil, err
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	merged := bool(query.Repository.PullRequest.Merged)
-	var mergeable *bool
-	switch query.Repository.PullRequest.Mergeable {
-	case githubv4.MergeableStateMergeable:
-		value := true
-		mergeable = &value
-	case githubv4.MergeableStateConflicting:
-		value := false
-		mergeable = &value
-	}
-	return &github.PullRequest{
-		Merged:   merged,
-		Mergable: mergeable,
-		Base:     github.PullRequestBranch{Ref: string(query.Repository.PullRequest.BaseRefName)},
-		Head:     github.PullRequestBranch{SHA: string(query.Repository.PullRequest.HeadRefOid)},
-		User:     github.User{Login: string(query.Repository.PullRequest.Author.Login)},
-	}, nil
+	return pr, nil
 }

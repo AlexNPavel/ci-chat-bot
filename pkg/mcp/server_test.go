@@ -286,6 +286,30 @@ func TestSlackLookupAndDMFailuresAreStructuredToolErrors(t *testing.T) {
 		}
 	})
 
+	for _, slackErr := range []string{"user_not_found", "user_not_visible", "account_inactive"} {
+		t.Run("unknown user "+slackErr, func(t *testing.T) {
+			managerFake := &fakeClusterManager{}
+			slackFake := newFakeSlack()
+			slackFake.userErr = slack.SlackErrorResponse{Err: slackErr}
+			server, session := connectForTest(t, managerFake, slackFake, "2026-07-28")
+			defer server.Close()
+			defer closeMCPSession(t, session)
+
+			result := callLaunch(t, session, map[string]any{
+				"slack_user_id": "U123",
+				"request_id":    "request-1",
+				"inputs":        []string{"4.19"},
+			})
+			if !result.IsError {
+				t.Fatal("CallTool() IsError = false, want true")
+			}
+			assertErrorCode(t, session, "launch_cluster", result, manager.ToolErrorCodeInvalidIdentity)
+			if managerFake.submitCalls != 0 {
+				t.Fatalf("SubmitCluster calls = %d, want 0", managerFake.submitCalls)
+			}
+		})
+	}
+
 	t.Run("profile lookup", func(t *testing.T) {
 		managerFake := &fakeClusterManager{}
 		slackFake := newFakeSlack()

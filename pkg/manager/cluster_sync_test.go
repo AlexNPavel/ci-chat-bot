@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -451,5 +452,29 @@ func TestSyncMonitorsPendingMCEJob(t *testing.T) {
 	}
 	if len(mceNames) != 2 || !mceNames[pending.Name] || !mceNames[succeeded.Name] {
 		t.Fatalf("MCE follow-up jobs = %v, want both MCE jobs", mceNames)
+	}
+}
+
+func TestCreateRosaClusterRejectedUntilRosaRecoveryCompletes(t *testing.T) {
+	m := newSyncTestManager(t)
+	m.maxRosaAge = 6 * time.Hour
+	m.rosaReady = false
+	if _, err := m.CreateRosaCluster("U123", "D123", "4.18", time.Hour); err == nil || !strings.Contains(err.Error(), "recovery") {
+		t.Fatalf("CreateRosaCluster error = %v, want a recovery-in-progress error", err)
+	}
+}
+
+func TestRecoverLaunchesDoesNotWaitForRosa(t *testing.T) {
+	m := newSyncTestManager(t)
+	m.rosaReady = false
+	recovered := make(chan struct{})
+	go m.recoverLaunches(wait.Backoff{Duration: time.Millisecond, Factor: 1, Steps: 10}, func() { close(recovered) })
+	select {
+	case <-recovered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Prow recovery did not complete")
+	}
+	if err := m.launchRecoveryError(""); err != nil {
+		t.Fatalf("Prow launches blocked before ROSA recovery: %v", err)
 	}
 }

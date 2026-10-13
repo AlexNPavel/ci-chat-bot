@@ -306,15 +306,18 @@ func (m *jobManager) updateRosaVersions() error {
 var launchRecoveryBackoff = wait.Backoff{Duration: 10 * time.Second, Factor: 2, Jitter: 0.1, Steps: 10, Cap: 2 * time.Minute}
 
 // Start begins background work and returns immediately. Launch admission
-// stays closed until recoverLaunches has rebuilt the Prow and ROSA inventory;
-// all other commands are available at once.
+// stays closed until recoverLaunches has rebuilt the Prow inventory; ROSA
+// launches additionally wait for the first successful ROSA sync. All other
+// commands are available at once.
 func (m *jobManager) Start() error {
 	m.lock.Lock()
 	m.started = time.Now()
 	m.launchReady = false
+	m.rosaReady = false
 	m.lock.Unlock()
 
 	go m.recoverLaunches(launchRecoveryBackoff, m.startSyncLoops)
+	go m.runRosaSyncLoop()
 	if m.startBackgroundLoops != nil {
 		m.startBackgroundLoops()
 	} else {
@@ -323,17 +326,12 @@ func (m *jobManager) Start() error {
 	return nil
 }
 
-// recoverLaunches retries the initial Prow and ROSA sync until both succeed,
-// then opens launch admission and calls afterRecovery. Each attempt runs both
-// syncs, so expiry and monitoring keep running while recovery is retried.
+// recoverLaunches retries the initial Prow sync until it succeeds, then opens
+// launch admission and calls afterRecovery. ROSA recovery runs separately in
+// runRosaSyncLoop so an OCM outage does not block Prow launches.
 func (m *jobManager) recoverLaunches(backoff wait.Backoff, afterRecovery func()) {
 	for {
 		err := m.sync()
-		if err != nil {
-			err = fmt.Errorf("unable to recover Prow launches: %w", err)
-		} else if err = m.rosaSync(); err != nil {
-			err = fmt.Errorf("unable to recover ROSA clusters: %w", err)
-		}
 		if err == nil {
 			break
 		}
@@ -350,9 +348,26 @@ func (m *jobManager) recoverLaunches(backoff wait.Backoff, afterRecovery func())
 	}
 }
 
-// startSyncLoops starts the periodic Prow and ROSA syncs once recovery has
-// run them. The first periodic run waits one interval, so sync side effects
-// such as MCE imageset creation never run twice back to back.
+// runRosaSyncLoop syncs ROSA clusters every minute, starting immediately.
+// ROSA launches are admitted after the first successful sync.
+func (m *jobManager) runRosaSyncLoop() {
+	wait.Forever(func() {
+		if err := m.rosaSync(); err != nil {
+			klog.Infof("error during rosa sync: %v", err)
+			return
+		}
+		m.lock.Lock()
+		if !m.rosaReady {
+			klog.Infof("ROSA cluster recovery complete; ROSA launches are enabled")
+		}
+		m.rosaReady = true
+		m.lock.Unlock()
+	}, time.Minute)
+}
+
+// startSyncLoops starts the periodic Prow sync once recovery has run it. The
+// first periodic run waits one interval, so sync side effects such as MCE
+// imageset creation never run twice back to back.
 func (m *jobManager) startSyncLoops() {
 	go func() {
 		time.Sleep(5 * time.Minute)
@@ -362,15 +377,6 @@ func (m *jobManager) startSyncLoops() {
 				return
 			}
 		}, time.Minute*5)
-	}()
-	go func() {
-		time.Sleep(time.Minute)
-		wait.Forever(func() {
-			if err := m.rosaSync(); err != nil {
-				klog.Infof("error during rosa sync: %v", err)
-				return
-			}
-		}, time.Minute)
 	}()
 }
 
@@ -2206,6 +2212,16 @@ func (m *jobManager) TerminateJobForUser(user string) (string, error) {
 	m.lock.RUnlock()
 	if job != nil && job.Mode == JobTypeLaunch {
 		if _, err := m.DestroyCluster(context.Background(), user, name); err != nil {
+			// The ProwJob of a finished launch may have aged out of retention.
+			// Release the stale request so the user can launch again.
+			if isToolErrorCode(err, ToolErrorCodeNotFound) && (job.Complete || isTerminalProwState(job.State)) {
+				m.lock.Lock()
+				if request := m.requests[user]; request != nil && request.Name == name {
+					delete(m.requests, user)
+				}
+				m.lock.Unlock()
+				return "the cluster has already finished, you may now launch another", nil
+			}
 			return "", fmt.Errorf("unable to terminate: %v", err)
 		}
 		return "the cluster was flagged for shutdown, you may now launch another", nil
@@ -2333,27 +2349,42 @@ func (m *jobManager) handleJobStartup(job Job, source string) {
 	m.finishedJob(job)
 }
 
+// finishedJobVerifyAttempts bounds how long a completed launch monitor waits
+// for Prow to confirm its final state before publishing what it observed.
+const finishedJobVerifyAttempts = 12
+
 func (m *jobManager) finishedJob(job Job) {
 	// Keep the completed monitor result until Prow can verify it. Release the
 	// lifecycle lock between attempts so destruction can proceed during outages.
-	for !m.tryFinishedJob(job) {
+	// After finishedJobVerifyAttempts failures, publish the monitor result so the
+	// user still receives credentials or the failure.
+	delay := m.finishedJobRetryDelay
+	if delay == 0 {
+		delay = 10 * time.Second
+	}
+	for attempt := 1; !m.tryFinishedJob(job, attempt < finishedJobVerifyAttempts); attempt++ {
 		if m.prowClient == nil || job.Mode != JobTypeLaunch {
 			return
 		}
-		klog.Warningf("Job %q final state verification failed; retaining monitor result for retry", job.Name)
-		time.Sleep(10 * time.Second)
+		klog.Warningf("Job %q final state verification failed (attempt %d/%d); retaining monitor result for retry", job.Name, attempt, finishedJobVerifyAttempts)
+		time.Sleep(delay)
 	}
 }
 
-// tryFinishedJob returns false when verification must be retried.
-func (m *jobManager) tryFinishedJob(job Job) bool {
+// tryFinishedJob returns false when verification must be retried. When
+// requireVerification is false, a failed Prow lookup publishes the monitor
+// result as observed.
+func (m *jobManager) tryFinishedJob(job Job, requireVerification bool) bool {
 	unlock := m.lifecycleLocks.lock(job.Name)
 	defer unlock()
 
 	// Check the durable state immediately before publishing monitor results. A
 	// destroy request can arrive while the monitor is waiting on cluster health.
 	if !m.refreshMonitorJobState(&job) {
-		return false
+		if requireVerification {
+			return false
+		}
+		klog.Warningf("Job %q final state could not be verified with Prow; publishing monitor result", job.Name)
 	}
 
 	m.lock.Lock()
@@ -2704,6 +2735,12 @@ func (m *jobManager) ListMceVersions() string {
 func (m *jobManager) CreateRosaCluster(user, channel, version string, duration time.Duration) (string, error) {
 	if duration > m.maxRosaAge {
 		return "", fmt.Errorf("max duration for a ROSA cluster is %s", m.maxRosaAge.String())
+	}
+	m.lock.RLock()
+	rosaReady := m.rosaReady
+	m.lock.RUnlock()
+	if !rosaReady {
+		return "", errors.New("ROSA cluster recovery is still in progress; retry shortly")
 	}
 	cluster, _ := m.getROSAClusterForUser(user)
 	if cluster != nil {

@@ -374,7 +374,7 @@ func TestFinishedJobDefersWhenProwStateCannotBeVerified(t *testing.T) {
 	})
 	notifications := make(chan struct{}, 1)
 	m.SetNotifier(func(Job) { notifications <- struct{}{} })
-	if m.tryFinishedJob(*stale) {
+	if m.tryFinishedJob(*stale, true) {
 		t.Fatal("unavailable Prow state did not request a retry")
 	}
 
@@ -386,6 +386,53 @@ func TestFinishedJobDefersWhenProwStateCannotBeVerified(t *testing.T) {
 	case <-notifications:
 		t.Fatal("monitor notified while Prow state could not be verified")
 	case <-time.After(25 * time.Millisecond):
+	}
+}
+
+func TestFinishedJobPublishesAfterVerificationRetriesExhausted(t *testing.T) {
+	now := time.Now().UTC()
+	pj := lifecycleProwJob("cluster-offline-long", "U123", JobTypeLaunch, prowapiv1.PendingState, now.Add(-time.Minute))
+	m, client := newLifecycleManager(pj)
+	m.finishedJobRetryDelay = time.Millisecond
+	result := cachedLifecycleJob(pj.Name, "U123", now.Add(-time.Minute))
+	current := cloneJob(result)
+	current.Credentials = ""
+	m.jobs[pj.Name] = current
+
+	var getCalls atomic.Int32
+	client.PrependReactor("get", "prowjobs", func(k8stesting.Action) (bool, runtime.Object, error) {
+		getCalls.Add(1)
+		return true, nil, errors.New("Prow unavailable")
+	})
+	notifications := make(chan Job, 1)
+	m.SetNotifier(func(job Job) { notifications <- job })
+
+	done := make(chan struct{})
+	go func() {
+		m.finishedJob(*result)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("finishedJob kept retrying after the verification limit")
+	}
+	if got := getCalls.Load(); got != finishedJobVerifyAttempts {
+		t.Fatalf("Prow verification attempts = %d, want %d", got, finishedJobVerifyAttempts)
+	}
+	select {
+	case job := <-notifications:
+		if job.Credentials == "" {
+			t.Fatalf("notification omitted the monitor credentials: %#v", job)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("user was not notified after Prow verification gave up")
+	}
+	m.lock.RLock()
+	stored := cloneJob(m.jobs[pj.Name])
+	m.lock.RUnlock()
+	if stored == nil || stored.Credentials == "" || !stored.NotificationSent {
+		t.Fatalf("monitor result was not stored after Prow verification gave up: %#v", stored)
 	}
 }
 
@@ -714,6 +761,22 @@ func TestDestroyClusterReleasesReservationWithoutProwJob(t *testing.T) {
 	reserved, message, err := m.reserveClusterSubmission(next, &Job{Name: "next", Mode: JobTypeLaunch, RequestedBy: "U123", State: prowapiv1.PendingState})
 	if err != nil || message != "" || !reserved {
 		t.Fatalf("new launch was not admitted: reserved=%v message=%q err=%v", reserved, message, err)
+	}
+}
+
+func TestTerminateJobForUserReleasesFinishedLaunchWithoutProwJob(t *testing.T) {
+	m, _ := newLifecycleManager()
+	job := phantomLaunchJob("finished", "U123", time.Now().Add(-time.Hour))
+	job.Complete = true
+	job.State = prowapiv1.SuccessState
+	m.jobs[job.Name] = job
+	m.requests["U123"] = &JobRequest{User: "U123", Name: job.Name, Type: JobTypeInstall, RequestSource: requestSourceSlack}
+
+	if _, err := m.TerminateJobForUser("U123"); err != nil {
+		t.Fatalf("TerminateJobForUser returned error: %v", err)
+	}
+	if _, ok := m.requests["U123"]; ok {
+		t.Fatalf("stale request was not released: %#v", m.requests["U123"])
 	}
 }
 

@@ -80,15 +80,10 @@ func (m *jobManager) reconcileProwJobs() (syncActions, error) {
 			}
 		}
 
+		// clusterJobFromProwJob sets the failure text for terminal states.
 		switch prowJob.Status.State {
-		case prowapiv1.FailureState, prowapiv1.ErrorState:
-			job.Failure = "job failed, see logs"
+		case prowapiv1.FailureState, prowapiv1.ErrorState, prowapiv1.AbortedState:
 			job.Complete = true
-		case prowapiv1.AbortedState:
-			job.Complete = true
-			if !job.TerminationRequested {
-				job.Failure = "job aborted"
-			}
 		case prowapiv1.SuccessState:
 			job.Complete = true
 			job.Failure = ""

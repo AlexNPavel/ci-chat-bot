@@ -580,3 +580,76 @@ func TestSelectLaunchJob(t *testing.T) {
 		t.Fatalf("selectLaunchJob() error = %v, want a configuration error", err)
 	}
 }
+
+func slackLaunchTestRequest(user string) *JobRequest {
+	return &JobRequest{
+		User:         user,
+		UserName:     "redhat-user",
+		Inputs:       [][]string{{launchTestImage}},
+		Type:         JobTypeInstall,
+		Platform:     "aws",
+		Architecture: "amd64",
+		JobParams:    map[string]string{"no-spot": ""},
+		Channel:      "C-" + user,
+		RequestedAt:  time.Now(),
+	}
+}
+
+func TestSlackLaunchAmbiguousCreateReleasesReservationWhenProwJobMissing(t *testing.T) {
+	f := newClusterLaunchFixture(2)
+	f.createHook = func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, context.DeadlineExceeded
+	}
+	if _, err := f.manager.LaunchJobForUser(slackLaunchTestRequest("U123")); err == nil {
+		t.Fatal("Slack launch succeeded after an ambiguous create error")
+	}
+	if f.manager.requests["U123"] != nil || len(f.manager.jobs) != 0 {
+		t.Fatalf("missing ProwJob kept the reservation: requests=%#v jobs=%#v", f.manager.requests, f.manager.jobs)
+	}
+}
+
+func TestSlackLaunchAmbiguousCreateKeepsReservationWhenLookupFails(t *testing.T) {
+	f := newClusterLaunchFixture(2)
+	f.createHook = func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, context.DeadlineExceeded
+	}
+	f.client.PrependReactor("get", "prowjobs", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, errors.New("Prow unavailable")
+	})
+	_, err := f.manager.LaunchJobForUser(slackLaunchTestRequest("U123"))
+	if err == nil || !strings.Contains(err.Error(), "`done`") {
+		t.Fatalf("ambiguous Slack launch error = %v, want a hint to run done", err)
+	}
+	if req := f.manager.requests["U123"]; req == nil || req.SubmissionInProgress {
+		t.Fatalf("ambiguous launch did not keep a finalized reservation: %#v", req)
+	}
+}
+
+func TestSubmitClusterFailedRetryKeepsReservationFromAmbiguousAttempt(t *testing.T) {
+	f := newClusterLaunchFixture(2)
+	f.createHook = func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, context.DeadlineExceeded
+	}
+	first, _ := successfulDMRequest("U123", "request-kept-retry", launchTestImage)
+	if _, err := f.manager.SubmitCluster(context.Background(), first); err == nil {
+		t.Fatal("ambiguous create unexpectedly succeeded")
+	}
+	kept := f.manager.requests["U123"]
+	if kept == nil || kept.SubmissionInProgress || f.manager.jobs[kept.Name] == nil {
+		t.Fatalf("ambiguous create did not keep a finalized reservation: request=%#v jobs=%#v", kept, f.manager.jobs)
+	}
+
+	retry := launchTestRequest("U123", "request-kept-retry", launchTestImage)
+	retry.ResolveDM = func(context.Context) (string, error) { return "", errors.New("Slack unavailable") }
+	_, err := f.manager.SubmitCluster(context.Background(), retry)
+	if toolErr := launchToolError(t, err); toolErr.Code != ToolErrorCodeBackendUnavailable {
+		t.Fatalf("retry error = %#v, want BACKEND_UNAVAILABLE", toolErr)
+	}
+	restored := f.manager.requests["U123"]
+	if restored == nil || restored.Name != kept.Name || restored.SubmissionInProgress || !restored.RequestedAt.Equal(kept.RequestedAt) {
+		t.Fatalf("failed retry did not restore the kept reservation: got %#v, want %#v", restored, kept)
+	}
+	if f.manager.jobs[kept.Name] == nil {
+		t.Fatal("failed retry deleted the kept job")
+	}
+}

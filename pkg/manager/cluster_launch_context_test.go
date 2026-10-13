@@ -2,7 +2,6 @@ package manager
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"testing"
@@ -153,16 +152,20 @@ func TestBusyProwWorkerNeverConfirmsUntestedCreate(t *testing.T) {
 	}
 }
 
-// fakePullRequestGitHub answers the pull request GraphQL query and GetRef.
+// fakePullRequestGitHub answers the REST pull request lookup and GetRef. Any
+// other client method, including GraphQL queries, panics.
 type fakePullRequestGitHub struct {
 	github.Client
-	graphQLResponse string
-	baseTip         string
-	refs            []string
+	pullRequest github.PullRequest
+	baseTip     string
+	refs        []string
+	pulls       []string
 }
 
-func (f *fakePullRequestGitHub) QueryWithGitHubAppsSupport(_ context.Context, q any, _ map[string]any, _ string) error {
-	return json.Unmarshal([]byte(f.graphQLResponse), q)
+func (f *fakePullRequestGitHub) GetPullRequest(org, repo string, number int) (*github.PullRequest, error) {
+	f.pulls = append(f.pulls, fmt.Sprintf("%s/%s#%d", org, repo, number))
+	pr := f.pullRequest
+	return &pr, nil
 }
 
 func (f *fakePullRequestGitHub) GetRefWithContext(_ context.Context, org, repo, ref string) (string, error) {
@@ -172,8 +175,12 @@ func (f *fakePullRequestGitHub) GetRefWithContext(_ context.Context, org, repo, 
 
 func TestResolveAsPullRequestUsesBaseBranchTip(t *testing.T) {
 	client := &fakePullRequestGitHub{
-		graphQLResponse: `{"repository":{"pullRequest":{"merged":false,"mergeable":"MERGEABLE","baseRefName":"main","baseRefOid":"stale-pr-base","headRefOid":"head-sha","author":{"login":"author"}}}}`,
-		baseTip:         "branch-tip",
+		pullRequest: github.PullRequest{
+			Base: github.PullRequestBranch{Ref: "main", SHA: "stale-pr-base"},
+			Head: github.PullRequestBranch{SHA: "head-sha"},
+			User: github.User{Login: "author"},
+		},
+		baseTip: "branch-tip",
 	}
 	m := &jobManager{githubClient: client}
 
@@ -186,6 +193,9 @@ func TestResolveAsPullRequestUsesBaseBranchTip(t *testing.T) {
 	}
 	if refs.BaseRef != "main" || len(refs.Pulls) != 1 || refs.Pulls[0].SHA != "head-sha" || refs.Pulls[0].Author != "author" {
 		t.Fatalf("refs = %#v", refs)
+	}
+	if len(client.pulls) != 1 || client.pulls[0] != "openshift/installer#123" {
+		t.Fatalf("GetPullRequest calls = %v", client.pulls)
 	}
 	if len(client.refs) != 1 || client.refs[0] != "openshift/installer:heads/main" {
 		t.Fatalf("GetRef calls = %v", client.refs)

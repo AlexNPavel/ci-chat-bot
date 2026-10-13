@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"maps"
@@ -260,6 +261,9 @@ func (r *identityResolver) lookup(ctx context.Context, userID string) (verifiedI
 		return verifiedIdentity{}, err
 	}
 	user, err := r.slack.GetUserInfoContext(ctx, userID)
+	if isSlackUnknownUserError(err) {
+		return verifiedIdentity{}, invalidIdentity()
+	}
 	if err != nil {
 		return verifiedIdentity{}, manager.ToolError{
 			Code:      manager.ToolErrorCodeBackendUnavailable,
@@ -275,6 +279,20 @@ func (r *identityResolver) lookup(ctx context.Context, userID string) (verifiedI
 		return verifiedIdentity{}, invalidIdentity()
 	}
 	return verifiedIdentity{SlackUserID: user.ID, UserName: username}, nil
+}
+
+// isSlackUnknownUserError reports whether Slack rejected the user ID itself,
+// as opposed to a transport or service failure that is worth retrying.
+func isSlackUnknownUserError(err error) bool {
+	var slackErr slack.SlackErrorResponse
+	if !errors.As(err, &slackErr) {
+		return false
+	}
+	switch slackErr.Err {
+	case "user_not_found", "user_not_visible", "account_inactive":
+		return true
+	}
+	return false
 }
 
 func (r *identityResolver) workspace(ctx context.Context) (string, error) {
