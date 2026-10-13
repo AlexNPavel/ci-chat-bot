@@ -3,6 +3,7 @@ package slack
 import (
 	"bytes"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -255,18 +256,26 @@ func GetUserName(client parser.SlackClient, userID string) string {
 // smaller than this.
 const maxVerifiedBodySize = 1 << 20
 
-func VerifiedBody(request *http.Request, signingSecret string) ([]byte, bool) {
+// VerifiedBody reads the request body and verifies its Slack signature. On
+// success it returns the body and a status of 0; on failure it returns the
+// HTTP status the caller should respond with.
+func VerifiedBody(writer http.ResponseWriter, request *http.Request, signingSecret string) ([]byte, int) {
 	verifier, err := slack.NewSecretsVerifier(request.Header, signingSecret)
 	if err != nil {
 		klog.Errorf("Failed to create a secrets verifier. %v", err)
-		return nil, false
+		return nil, http.StatusInternalServerError
 	}
 
-	request.Body = http.MaxBytesReader(nil, request.Body, maxVerifiedBodySize)
+	request.Body = http.MaxBytesReader(writer, request.Body, maxVerifiedBodySize)
 	body, err := io.ReadAll(request.Body)
 	if err != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			klog.Errorf("Rejected an event payload larger than %d bytes", maxBytesErr.Limit)
+			return nil, http.StatusRequestEntityTooLarge
+		}
 		klog.Errorf("Failed to read an event payload. %v", err)
-		return nil, false
+		return nil, http.StatusInternalServerError
 	}
 
 	// need to use body again when unmarshalling
@@ -274,15 +283,15 @@ func VerifiedBody(request *http.Request, signingSecret string) ([]byte, bool) {
 
 	if _, err := verifier.Write(body); err != nil {
 		klog.Errorf("Failed to hash an event payload. %v", err)
-		return nil, false
+		return nil, http.StatusInternalServerError
 	}
 
 	if err = verifier.Ensure(); err != nil {
 		klog.Errorf("Failed to verify an event payload. %v", err)
-		return nil, false
+		return nil, http.StatusInternalServerError
 	}
 
-	return body, true
+	return body, 0
 }
 
 func GetPlatformArchFromWorkflowConfig(workflowConfig *manager.WorkflowConfig, name string) (string, string, error) {
@@ -719,6 +728,21 @@ func ParseOptions(options string, inputs [][]string, jobType manager.JobType) (s
 		return "", "", nil, fmt.Errorf("The hypershift-hosted platform requires a multiarch image. See: https://docs.ci.openshift.org/docs/architecture/ci-operator/#testing-with-a-cluster-from-hypershift") //nolint:staticcheck
 	}
 	return platform, architecture, params, nil
+}
+
+// FullProvisionIfFailed re-fetches the untrimmed provision for a failed
+// install so that re-notifications upload the complete install log rather
+// than the trimmed copy cached by the manager.
+func FullProvisionIfFailed(jobManager manager.JobManager, name string, provision *hivev1.ClusterProvision) *hivev1.ClusterProvision {
+	if provision == nil || provision.Spec.Stage != hivev1.ClusterProvisionStageFailed {
+		return provision
+	}
+	full, err := jobManager.GetClusterProvision(name)
+	if err != nil {
+		klog.Errorf("Failed to get full cluster provision for %s: %v", name, err)
+		return provision
+	}
+	return full
 }
 
 func NotifyMce(client parser.SlackClient, cluster *clusterv1.ManagedCluster, clusterDeployment *hivev1.ClusterDeployment, clusterProvision *hivev1.ClusterProvision, kubeconfig, password string, postMessage bool, errMsg error) (string, string) {

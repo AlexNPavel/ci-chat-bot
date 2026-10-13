@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	v1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -32,11 +33,14 @@ var MCEPlatforms = sets.New([]string{"aws", "gcp"}...)
 
 // maxRetainedInstallLog bounds how much of a provision's install log is kept in
 // memory between syncs. The full log is uploaded to the user when a failure is
-// first observed; only later re-fetches (e.g. `mce auth`) see the trimmed log.
+// first observed, and user-triggered re-notifications (e.g. `mce auth`) re-fetch
+// the full provision via GetClusterProvision.
 const maxRetainedInstallLog = 1 << 20
 
 // trimInstallLog drops all but the tail of an install log that exceeds
 // maxRetainedInstallLog, since the reason for a failed install is at the end.
+// The cut is moved forward to the next line, or at least to a rune boundary, so
+// the retained tail is valid UTF-8 if the original log was.
 func trimInstallLog(provision *hivev1.ClusterProvision) {
 	if provision.Spec.InstallLog == nil {
 		return
@@ -45,8 +49,35 @@ func trimInstallLog(provision *hivev1.ClusterProvision) {
 	if len(installLog) <= maxRetainedInstallLog {
 		return
 	}
-	trimmed := fmt.Sprintf("[... install log truncated to the last %d bytes ...]\n%s", maxRetainedInstallLog, installLog[len(installLog)-maxRetainedInstallLog:])
+	start := len(installLog) - maxRetainedInstallLog
+	if i := strings.IndexByte(installLog[start:], '\n'); i >= 0 && start+i+1 < len(installLog) {
+		start += i + 1
+	} else {
+		for start < len(installLog) && !utf8.RuneStart(installLog[start]) {
+			start++
+		}
+	}
+	tail := installLog[start:]
+	trimmed := fmt.Sprintf("[... install log truncated to the last %d bytes ...]\n%s", len(tail), tail)
 	provision.Spec.InstallLog = &trimmed
+}
+
+// GetClusterProvision returns the full, untrimmed provision for the named
+// cluster. If the provision cannot be fetched, the cached (possibly trimmed)
+// copy is returned instead.
+func (m *jobManager) GetClusterProvision(name string) (*hivev1.ClusterProvision, error) {
+	m.mceClusters.lock.RLock()
+	cached, ok := m.mceClusters.provisions[name]
+	m.mceClusters.lock.RUnlock()
+	if !ok || cached == nil {
+		return nil, fmt.Errorf("no provision found for cluster %s", name)
+	}
+	provision := &hivev1.ClusterProvision{}
+	if err := m.dpcrHiveClient.Get(context.TODO(), client.ObjectKey{Namespace: cached.Namespace, Name: cached.Name}, provision); err != nil {
+		klog.Errorf("Failed to get cluster provision %s/%s, using cached copy: %v", cached.Namespace, cached.Name, err)
+		return cached, nil
+	}
+	return provision, nil
 }
 
 // mceClusterIsAWS reports whether the managed cluster runs on AWS. Hive ClusterDeployment may be

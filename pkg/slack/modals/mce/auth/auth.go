@@ -38,7 +38,7 @@ func process(updater *slack.Client, jobManager manager.JobManager, httpclient *h
 				msg = "You have multiple running clusters. Please specify the name of the cluster you are requesting credentials for."
 			}
 			if msg == "" {
-				msg, kubeconfig = localslack.NotifyMce(updater, managed[name], deployments[name], provisions[name], kubeconfigs[name], passwords[name], false, nil)
+				msg, kubeconfig = localslack.NotifyMce(updater, managed[name], deployments[name], localslack.FullProvisionIfFailed(jobManager, name, provisions[name]), kubeconfigs[name], passwords[name], false, nil)
 			}
 			submission := modals.SubmissionView(title, msg)
 			common.AppendKubeconfigBlock(&submission, kubeconfig, "KubeConfig File (to download the kubeconfig as a file, type `mce auth` in the Messages tab):")

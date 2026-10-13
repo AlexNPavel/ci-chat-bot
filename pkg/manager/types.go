@@ -416,6 +416,7 @@ type JobManager interface {
 
 	CreateMceCluster(user, channel, platform string, from [][]string, duration time.Duration) (string, error)
 	DeleteMceCluster(user, clusterName string) (string, error)
+	GetClusterProvision(name string) (*hivev1.ClusterProvision, error)
 	GetManagedClustersForUser(user string) (map[string]*clusterv1.ManagedCluster, map[string]*hivev1.ClusterDeployment, map[string]*hivev1.ClusterProvision, map[string]string, map[string]string)
 	ListManagedClusters(user string) (string, string, []string)
 	ListMceVersions() string

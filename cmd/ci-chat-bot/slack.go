@@ -58,7 +58,6 @@ func Start(bot *slack.Bot, jobManager manager.JobManager, httpclient *http.Clien
 		Handler:           mux,
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
-		WriteTimeout:      30 * time.Second,
 		IdleTimeout:       2 * time.Minute,
 	}
 	health.ServeReady(func() bool {
@@ -80,9 +79,9 @@ func Start(bot *slack.Bot, jobManager manager.JobManager, httpclient *http.Clien
 func handleEvent(signingSecret string, handler eventhandler.Handler) http.HandlerFunc {
 	return func(writer http.ResponseWriter, request *http.Request) {
 		logger := logrus.WithField("api", "events")
-		body, ok := slack.VerifiedBody(request, signingSecret)
-		if !ok {
-			writer.WriteHeader(http.StatusInternalServerError)
+		body, status := slack.VerifiedBody(writer, request, signingSecret)
+		if status != 0 {
+			writer.WriteHeader(status)
 			return
 		}
 		event, err := slackevents.ParseEvent(body, slackevents.OptionNoVerifyToken())
@@ -122,8 +121,8 @@ func handleEvent(signingSecret string, handler eventhandler.Handler) http.Handle
 func handleInteraction(signingSecret string, handler interactionhandler.Handler) http.HandlerFunc {
 	return func(writer http.ResponseWriter, request *http.Request) {
 		logger := logrus.WithField("api", "interactionhandler")
-		if _, ok := slack.VerifiedBody(request, signingSecret); !ok {
-			writer.WriteHeader(http.StatusInternalServerError)
+		if _, status := slack.VerifiedBody(writer, request, signingSecret); status != 0 {
+			writer.WriteHeader(status)
 			return
 		}
 

@@ -257,7 +257,7 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("unabel to create release client: %w", err)
 	}
-	rosaSecretClient := releaseClient.Secrets("ci")
+	rosaSecretClient := releaseClient.Secrets(utils.ProwJobNamespace)
 	// Config and Client to access hypershift configmaps
 	var hiveConfigMapClient corev1.ConfigMapInterface
 	if config, ok := kubeConfigs["hosted-mgmt"]; ok {

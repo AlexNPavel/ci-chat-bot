@@ -10,6 +10,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/klog"
 	prowapiv1 "sigs.k8s.io/prow/pkg/apis/prowjobs/v1"
 	"sigs.k8s.io/prow/pkg/config"
 )
@@ -65,7 +66,6 @@ func JobForConfig(prowConfigLoader ProwConfigLoader, jobName string) (*prowapiv1
 			State:     state,
 		},
 	}
-	pj = pj.DeepCopy()
 	return pj, nil
 }
 
@@ -140,15 +140,17 @@ func OverrideJobEnvVar(spec *prowapiv1.ProwJobSpec, name, value string) {
 }
 
 func prowSpecForPeriodicConfig(config *config.Periodic) *prowapiv1.ProwJobSpec {
-	spec := pjutil.PeriodicSpec(*config)
-	if spec.DecorationConfig != nil {
-		// the spec shares the periodic's DecorationConfig with the live prow
-		// config, so copy it before mutating to avoid writing through to it
-		spec.DecorationConfig = spec.DecorationConfig.DeepCopy()
-		isTrue := true
-		spec.DecorationConfig.SkipCloning = &isTrue
+	// the spec shares pointers, slices, and maps with the live prow config, so
+	// copy it entirely before mutating to avoid writing through to it
+	periodicSpec := pjutil.PeriodicSpec(*config)
+	spec := periodicSpec.DeepCopy()
+	if spec.DecorationConfig == nil {
+		klog.Warningf("Prow job %s has no decoration config; setting skip_cloning on an empty one", config.Name)
+		spec.DecorationConfig = &prowapiv1.DecorationConfig{}
 	}
-	return &spec
+	isTrue := true
+	spec.DecorationConfig.SkipCloning = &isTrue
+	return spec
 }
 
 func hasProwJob(config *config.Config, name string) (*config.Periodic, bool) {

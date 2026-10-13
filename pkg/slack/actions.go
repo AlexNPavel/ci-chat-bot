@@ -124,7 +124,7 @@ func MceAuth(client parser.SlackClient, jobManager manager.JobManager, event *sl
 	} else if _, ok := managed[name]; !ok {
 		return fmt.Sprintf("No cluster called `%s` for your user found", name)
 	}
-	NotifyMce(client, managed[name], deployments[name], provisions[name], kubeconfigs[name], passwords[name], true, nil)
+	NotifyMce(client, managed[name], deployments[name], FullProvisionIfFailed(jobManager, name, provisions[name]), kubeconfigs[name], passwords[name], true, nil)
 	return ""
 }
 

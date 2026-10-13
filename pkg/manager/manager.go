@@ -389,7 +389,10 @@ func (m *jobManager) mceSync() error {
 	provisions := map[string]*hivev1.ClusterProvision{}
 	for _, deployment := range deployments {
 		clusterDeployments[deployment.Name] = deployment
-		provisionList := &hivev1.ClusterProvisionList{}
+		// list only metadata so that install logs of older provisions are never
+		// fetched, then get the full object for the newest provision
+		provisionList := &metav1.PartialObjectMetadataList{}
+		provisionList.SetGroupVersionKind(hivev1.SchemeGroupVersion.WithKind("ClusterProvisionList"))
 		if err := m.dpcrHiveClient.List(context.TODO(), provisionList, &crclient.ListOptions{LabelSelector: labels.SelectorFromSet(labels.Set{"hive.openshift.io/cluster-deployment-name": deployment.Name})}); err != nil {
 			metrics.RecordError(errorMCEListClusterProvisions, m.errorMetric)
 			klog.Errorf("Failed to get cluster provision ref: %v", err)
@@ -399,13 +402,19 @@ func (m *jobManager) mceSync() error {
 			klog.Warningf("No matching provision found for cluster %s", deployment.Name)
 			continue
 		}
-		newestProvision := &provisionList.Items[0]
-		for _, extraProvision := range provisionList.Items {
-			if extraProvision.CreationTimestamp.After(newestProvision.CreationTimestamp.Time) {
-				newestProvision = &extraProvision
+		newest := 0
+		for i := range provisionList.Items {
+			if provisionList.Items[i].CreationTimestamp.After(provisionList.Items[newest].CreationTimestamp.Time) {
+				newest = i
 			}
 		}
-		provisions[deployment.Name] = newestProvision
+		provision := hivev1.ClusterProvision{}
+		if err := m.dpcrHiveClient.Get(context.TODO(), crclient.ObjectKey{Namespace: provisionList.Items[newest].Namespace, Name: provisionList.Items[newest].Name}, &provision); err != nil {
+			metrics.RecordError(errorMCEListClusterProvisions, m.errorMetric)
+			klog.Errorf("Failed to get cluster provision %s/%s: %v", provisionList.Items[newest].Namespace, provisionList.Items[newest].Name, err)
+			continue
+		}
+		provisions[deployment.Name] = &provision
 	}
 	for name, cluster := range managedClusters {
 		m.mceClusters.lock.RLock()
@@ -441,7 +450,10 @@ func (m *jobManager) mceSync() error {
 				// notify that the cluster is available and retrieve auth
 				kubeconfig, password, err := m.getClusterAuth(name)
 				if err != nil {
-					return fmt.Errorf("failed to get mce cluster auth: %v", err)
+					// getClusterAuth records the error metric; the cluster is not
+					// annotated as notified, so the next sync retries
+					klog.Errorf("Failed to get mce cluster auth for %s: %v", name, err)
+					continue
 				}
 				m.mceNotifierFn(cluster, clusterDeployments[name], provisions[name], kubeconfig, password, nil)
 				cluster.Annotations[utils.UserNotifiedTag] = "true"
@@ -666,7 +678,7 @@ func (m *jobManager) rosaSync() error {
 		activeRosaIDs, err = m.rosaSecretClient.Create(context.TODO(), &corev1.Secret{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      RosaClusterSecretName,
-				Namespace: "ci",
+				Namespace: utils.ProwJobNamespace,
 			},
 			Data: map[string][]byte{},
 			Type: corev1.SecretTypeOpaque,
